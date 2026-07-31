@@ -1,0 +1,15 @@
+.vectorai_db/
+node_modules/
+dist/
+out/
+__pycache__/
+venv/
+.env
+last_repo.json
+.DS_Store
+*.vsix
+.vectorai_db/
+last_repo.json
+*.vsix
+node_modules/
+dist/
