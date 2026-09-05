@@ -390,15 +390,8 @@ npm run watch
 
 ---
 
-## 📄 License
-
-MIT — see [LICENSE](LICENSE)
-
----
-
 <div align="center">
 
-**Built For hackthon & I literally killed it. ** · April 2026
 
 *CodeLens is proof that developer tools don't need the cloud to be powerful.*
 
