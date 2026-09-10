@@ -12,8 +12,9 @@ simple and exactly correct, and it is fast enough at the scale a single
 repository reaches. It is also the first thing that would need to change to
 scale much further.
 
-The class is kept behind a narrow interface so a different storage backend
-could be substituted later without touching the indexer or the query path.
+LocalVectorStore implements the VectorStore Protocol in backend/vector_store.py.
+That interface is where the contract lives; this module is the only
+implementation of it, and no second backend exists.
 
 Schema
 ------
@@ -44,6 +45,7 @@ from typing import List, Dict, Any, Optional, Iterable, Sequence
 import numpy as np
 
 from backend.config import Settings
+from backend.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +154,9 @@ class LocalVectorStore:
     repository, which is exact cosine similarity rather than an approximate
     index. The embedding width is whatever the configured model produces; it is
     not assumed to be any particular size.
+
+    Implements the VectorStore Protocol structurally - there is no inheritance,
+    so this module stays unaware of the interface module.
     """
 
     def __init__(self, path: Optional[str] = None):
@@ -574,10 +579,10 @@ class LocalVectorStore:
 
 
 # Singleton - one store per process.
-_db_instance: Optional[LocalVectorStore] = None
+_db_instance: Optional[VectorStore] = None
 
 
-def get_db() -> LocalVectorStore:
+def get_db() -> VectorStore:
     global _db_instance
     if _db_instance is None:
         _db_instance = LocalVectorStore()
