@@ -167,6 +167,11 @@ class QueryRequest(BaseModel):
     # repository; when omitted the most recently indexed one is used.
     repo_path: str | None = None
 
+    # Optional filters, applied in SQL before scoring.
+    language: str | None = None
+    path_prefix: str | None = None
+    symbol_type: str | None = None
+
 
 class QueryResult(BaseModel):
     """One search hit."""
@@ -375,7 +380,15 @@ async def api_query(req: QueryRequest):
     db = get_db()
 
     try:
-        data = await run_query(req.query, repo_id=repo_id, top_k=req.top_k, explain=req.explain)
+        data = await run_query(
+            req.query,
+            repo_id=repo_id,
+            top_k=req.top_k,
+            explain=req.explain,
+            language=req.language,
+            path_prefix=req.path_prefix,
+            symbol_type=req.symbol_type,
+        )
     except EmbeddingModelMismatch as e:
         # 409: the index is in a state incompatible with the request, and the
         # user has a concrete action (re-index). Not a 500.

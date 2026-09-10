@@ -185,6 +185,18 @@
             margin-bottom: 4px;
         }
 
+        .symbol-kind {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--vscode-descriptionForeground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 3px;
+            padding: 1px 5px;
+            margin-right: 6px;
+            white-space: nowrap;
+        }
+
         .symbol-name {
             color: var(--vscode-symbolIcon-functionForeground);
             font-weight: bold;
@@ -563,10 +575,10 @@
                         li.innerHTML = `
                             <div class="card-header">
                                 <span class="filename">${r.file_path}</span>
-                                <span class="line-range">line ${r.start_line}–${r.end_line}</span>
+                                <span class="line-range">${r.language ? r.language + ' · ' : ''}line ${r.start_line}–${r.end_line}</span>
                             </div>
                             <div class="symbol-row">
-                                <span class="symbol-name" title="${r.symbol_name}">${r.symbol_name}</span>
+                                <span class="symbol-name" title="${r.qualified_name || r.symbol_name}">${r.symbol_type ? `<span class="symbol-kind">${r.symbol_type}</span>` : ''}${r.symbol_name}</span>
                                 <div class="score-wrap">
                                     <div class="score-track"><div class="score-fill" style="width: ${calculatedWidth}%; background-color: ${severityClassColor};"></div></div>
                                     ${(r.score).toFixed(2)}
