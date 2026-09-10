@@ -10,10 +10,12 @@
  *    first signal (and Windows has no signals at all - see stop()).
  */
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { spawn, ChildProcess } from 'child_process';
 import axios from 'axios';
-import { apiUrl, getStartupTimeoutMs, getOllamaHost, getPort } from './config';
+import { apiUrl, getStartupTimeoutMs, getOllamaHost, getOllamaSetting, getPort } from './config';
 import { ensureBackendEnv, BackendSetupError } from './pythonEnv';
+import { resolveOllama, pathPrefixFor, ToolResolutionError } from './toolResolver';
 
 /** How often to re-probe /health while waiting for startup. */
 const POLL_INTERVAL_MS = 250;
@@ -109,6 +111,23 @@ export class BackendController {
 
         let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 
+        // Locating Ollama is best-effort at spawn time: the backend talks to it
+        // over HTTP, so a missing CLI is not fatal here. Finding it lets us put
+        // its directory on PATH, which matters when VS Code was launched from a
+        // GUI and did not inherit a login shell's PATH. /health reports the
+        // real reachability, and activate() warns from that.
+        const childEnv: NodeJS.ProcessEnv = { ...process.env, OLLAMA_HOST: getOllamaHost() };
+        try {
+            const ollama = await resolveOllama(getOllamaSetting());
+            const prefix = pathPrefixFor(ollama);
+            if (prefix) {
+                childEnv.PATH = `${prefix}${path.delimiter}${process.env.PATH ?? ''}`;
+            }
+        } catch (err) {
+            const detail = err instanceof ToolResolutionError ? `${err.message} ${err.remedy}` : String(err);
+            console.warn(`[CodeLens] ${detail}`);
+        }
+
         try {
             this.child = spawn(
                 env.pythonPath,
@@ -116,7 +135,7 @@ export class BackendController {
                 {
                     cwd: env.extensionRoot,
                     detached: false,
-                    env: { ...process.env, OLLAMA_HOST: getOllamaHost() },
+                    env: childEnv,
                 },
             );
         } catch (err) {
