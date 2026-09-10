@@ -19,6 +19,16 @@ from backend.config import Settings
 logger = logging.getLogger(__name__)
 
 
+class EmbeddingModelMismatch(RuntimeError):
+    """
+    Raised when the index was built with a different embedding model.
+
+    Vectors from two different models are not comparable: scoring one against
+    the other produces plausible-looking numbers that mean nothing. Refusing is
+    the only honest option.
+    """
+
+
 def _get_ollama_client() -> AsyncClient:
     return AsyncClient(host=Settings.OLLAMA_HOST)
 
@@ -34,6 +44,19 @@ async def run_query(
     2. Score it against every stored chunk (exact cosine similarity).
     3. Optionally summarise the top hits with a local chat model.
     """
+    db = get_db()
+
+    # Refuse to query an index built with a different model, rather than
+    # returning silently meaningless scores.
+    meta = db.get_index_metadata(repo_id) or {}
+    indexed_model = meta.get("embedding_model")
+    if indexed_model and indexed_model != Settings.EMBED_MODEL:
+        raise EmbeddingModelMismatch(
+            f"This index was built with embedding model {indexed_model!r} but the "
+            f"backend is configured for {Settings.EMBED_MODEL!r}. Vectors from "
+            f"different models are not comparable. Re-index this repository."
+        )
+
     client = _get_ollama_client()
 
     # --- Embed query ---
@@ -47,7 +70,13 @@ async def run_query(
         raise
 
     # --- Exact cosine search over the stored chunks ---
-    db = get_db()
+    indexed_dim = meta.get("embedding_dimension") or 0
+    if indexed_dim and len(query_vec) != indexed_dim:
+        raise EmbeddingModelMismatch(
+            f"The query embedding has {len(query_vec)} dimensions but this index "
+            f"was built with {indexed_dim}. Re-index this repository."
+        )
+
     raw_results = db.search(query_vec, repo_id=repo_id, top_k=top_k)
 
     # Normalise scores to [0, 1]
