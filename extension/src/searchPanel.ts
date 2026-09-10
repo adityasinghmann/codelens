@@ -153,14 +153,23 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
 
         const message = parsed.value;
         switch (message.type) {
-            case 'progress':
+            case 'progress': {
+                // files/files, not chunks/files: the old formula divided one
+                // file's chunk count by the repo's file count, which is
+                // dimensionally meaningless and routinely exceeded 100%.
+                const total = Math.max(1, Number(message.total_files) || 0);
+                const done = Number(message.processed_files) || 0;
+                const pct = Math.max(0, Math.min(100, (done / total) * 100));
                 this._view?.webview.postMessage({
                     type: 'indexProgress',
                     file: message.file,
-                    pct: (message.chunks / Math.max(1, message.total_files)) * 100,
-                    message: `${message.chunks} chunks found`
+                    pct,
+                    processedFiles: done,
+                    totalFiles: total,
+                    processedChunks: Number(message.processed_chunks) || 0,
                 });
                 return false;
+            }
             case 'complete':
                 this._view?.webview.postMessage({
                     type: 'status',

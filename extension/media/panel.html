@@ -401,7 +401,7 @@
             <div class="progress-bar-fill" id="prog-bar"></div>
         </div>
         <div style="font-size: 11px; color: var(--vscode-descriptionForeground);" id="prog-text">
-            Indexed <span id="prog-pct">0</span> / 100% · <span id="prog-chunks">0</span> chunks found
+            <span id="prog-files">0 / 0 files</span> · <span id="prog-pct">0</span>% · <span id="prog-chunks">0</span> chunks
         </div>
     </div>
 
@@ -434,7 +434,8 @@
             progFile: document.getElementById('prog-file'),
             progBar: document.getElementById('prog-bar'),
             progPct: document.getElementById('prog-pct'),
-            progChunks: document.getElementById('prog-chunks')
+            progChunks: document.getElementById('prog-chunks'),
+            progFiles: document.getElementById('prog-files')
         };
         
         let navigationIndex = -1;
@@ -589,12 +590,18 @@
                     
                     break;
                     
-                case 'indexProgress':
+                case 'indexProgress': {
+                    // pct is files-processed / files-total, already clamped to
+                    // 0-100 by the extension host.
+                    const pct = Math.max(0, Math.min(100, Number(stream.pct) || 0));
                     uiTokens.progFile.innerText = stream.file;
-                    uiTokens.progBar.style.width = `${Math.min(100, stream.pct)}%`;
-                    uiTokens.progPct.innerText = Math.round(stream.pct);
-                    uiTokens.chunkBadge.innerText = stream.message;
+                    uiTokens.progBar.style.width = `${pct}%`;
+                    uiTokens.progPct.innerText = Math.round(pct);
+                    uiTokens.progFiles.innerText = `${stream.processedFiles} / ${stream.totalFiles} files`;
+                    uiTokens.progChunks.innerText = stream.processedChunks;
+                    uiTokens.chunkBadge.innerText = `${stream.processedChunks} chunks`;
                     break;
+                }
                     
                 case 'status':
                     uiTokens.progCont.classList.add('hidden');
