@@ -59,8 +59,31 @@
       {
         "command": "codelens.showStatus",
         "title": "CodeLens: Show Status"
+      },
+      {
+        "command": "codelens.restartBackend",
+        "title": "CodeLens: Restart Backend",
+        "icon": "$(debug-restart)"
       }
     ],
+    "configuration": {
+      "title": "CodeLens",
+      "properties": {
+        "codelens.port": {
+          "type": "integer",
+          "default": 8000,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Loopback port the bundled CodeLens backend listens on."
+        },
+        "codelens.startupTimeoutSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "How long to wait for the backend to answer /health before reporting a startup failure."
+        }
+      }
+    },
     "menus": {
       "editor/title": [
         {

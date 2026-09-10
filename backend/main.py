@@ -53,26 +53,27 @@ async def lifespan(app: FastAPI):
     # Init DB explicitly to load resources safely
     db = get_db()
     
-    print("\n" + "="*60)
-    print("🚀 CodeLens Backend Engine Starting...")
-    print(f"📁 VectorAI DB Path: {Settings.VECTORAI_DB_PATH}")
-    print(f"📦 Total Chunks in DB: {db.count()}")
-    
+    # Log rather than print, and keep it ASCII: on Windows the console encoding
+    # is cp1252 by default and a non-encodable character raised
+    # UnicodeEncodeError from inside lifespan, which aborted application startup
+    # entirely -- the backend never came up at all.
+    logger.info("CodeLens backend starting")
+    logger.info("Index path: %s", Settings.VECTORAI_DB_PATH)
+    logger.info("Total chunks in index: %d", db.count())
+
     import urllib.request
     try:
         urllib.request.urlopen(f"{Settings.OLLAMA_HOST}/api/tags", timeout=2)
-        print("🟢 Ollama Status: ONLINE")
+        logger.info("Ollama status: online")
     except Exception as e:
-        print(f"🔴 Ollama Status: OFFLINE ({e})")
-        
+        logger.warning("Ollama status: offline (%s)", e)
+
     last_repo = get_last_repo()
     if last_repo and os.path.exists(last_repo) and os.path.isdir(last_repo):
-        print(f"🔍 Restoring live file watcher for: {last_repo}")
+        logger.info("Restoring live file watcher for: %s", last_repo)
         global_indexer = Indexer(last_repo)
         global_indexer.start_watchdog()
-        
-    print("="*60 + "\n")
-    
+
     yield
     
     # Teardown logic
