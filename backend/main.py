@@ -123,39 +123,45 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
             
         files = list(indexer.walk_repo())
         total_files = len(files)
-        total_chunks = 0
+        processed_files = 0
+        processed_chunks = 0
         start_time = time.time()
-        
+
         local_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(local_loop)
-        
+
         for file_path in files:
+            rel = os.path.relpath(file_path, repo_path)
             try:
-                rel = os.path.relpath(file_path, repo_path)
                 chunks = chunk_file(file_path, repo_path)
-                chunk_count = len(chunks)
-                total_chunks += chunk_count
-                
-                send({
-                    "type": "progress", 
-                    "file": rel, 
-                    "chunks": chunk_count, 
-                    "total_files": total_files
-                })
-                
+                processed_chunks += len(chunks)
+
                 if chunks:
                     local_loop.run_until_complete(indexer.embed_and_store(chunks))
             except Exception as err:
-                 send({"type": "error", "message": str(err), "file": str(file_path)})
+                send({"type": "error", "message": str(err), "file": rel})
+            finally:
+                # Count the file as processed even when it failed, so the
+                # progress denominator and numerator stay in the same units and
+                # the bar always reaches 100%.
+                processed_files += 1
+                send({
+                    "type": "progress",
+                    "file": rel,
+                    "processed_files": processed_files,
+                    "total_files": total_files,
+                    "processed_chunks": processed_chunks,
+                })
 
         local_loop.close()
         
         duration = int((time.time() - start_time) * 1000)
         send({
-            "type": "complete", 
-            "total_chunks": total_chunks, 
-            "duration_ms": duration, 
-            "skipped": 0 # Tracked internally by incremental hashes logic
+            "type": "complete",
+            "total_files": total_files,
+            "processed_files": processed_files,
+            "total_chunks": processed_chunks,
+            "duration_ms": duration,
         })
         
         save_last_repo(repo_path)
