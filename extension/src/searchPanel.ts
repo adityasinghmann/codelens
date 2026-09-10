@@ -6,6 +6,7 @@ import * as http from 'http';
 import { apiUrl } from './config';
 import { SseParser, parseJsonEvent, SseEvent } from './sseParser';
 import { IndexEvent, QueryResponse, IndexRequest, QueryRequest } from './apiTypes';
+import { resolveInsideRoot } from './paths';
 
 export class SearchPanelProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -207,21 +208,10 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
         // Containment check. `file` comes from a search result, which comes
         // from the index, which is built from files on disk - but it is still
         // untrusted input by the time it round-trips through the webview, and
-        // path.join happily resolves "../../../etc/passwd". Resolve first,
-        // then confirm the result is genuinely inside the workspace.
-        const root = path.resolve(workspace);
-        const absolutePath = path.resolve(root, file);
-        const relative = path.relative(root, absolutePath);
-
-        const escapes =
-            relative === '' ||
-            relative.startsWith('..') ||
-            path.isAbsolute(relative);
-
-        if (escapes) {
-            console.error(
-                `[CodeLens] Refusing to open a path outside the workspace: ${file} -> ${absolutePath}`
-            );
+        // path.join happily resolves "../../../etc/passwd".
+        const absolutePath = resolveInsideRoot(workspace, file);
+        if (absolutePath === null) {
+            console.error(`[CodeLens] Refusing to open a path outside the workspace: ${file}`);
             vscode.window.showErrorMessage(
                 `CodeLens refused to open "${file}" because it resolves outside the workspace.`
             );
