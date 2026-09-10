@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 # what has been indexed, and unlike the sidecar it can hold more than one.
 global_indexer: Indexer | None = None
 
+# repo_ids with an index run in flight. Two overlapping POST /index calls for
+# the same repository previously raced on global_indexer and on each other's
+# rows; the second is now rejected with 409. Different repositories may run
+# concurrently - that falls out of the per-repo scoping and needs no queue.
+_active_indexing: set[str] = set()
+_active_lock = threading.Lock()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global global_indexer
@@ -150,7 +157,8 @@ class HealthResponse(BaseModel):
     index: bool
     ollama_error: str | None = None
 
-def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asyncio.AbstractEventLoop):
+def indexer_worker(repo_path: str, repo_id: str, force: bool,
+                   q: asyncio.Queue, main_loop: asyncio.AbstractEventLoop):
     def send(event: dict | None):
         asyncio.run_coroutine_threadsafe(q.put(event), main_loop)
 
@@ -159,16 +167,23 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
         db = get_db()
 
         if force:
-            # Drop only THIS repository's files and chunks. Other repositories
-            # indexed by the same backend are untouched.
+            # Drop only THIS repository's files and chunks, then reset its
+            # metadata so the model/dimension are re-derived from the rebuild.
+            # Other repositories indexed by the same backend are untouched.
             db.clear_repository_content(indexer.repo_id)
-            db.set_index_metadata(indexer.repo_id, status="rebuilding")
+            db.set_index_metadata(
+                indexer.repo_id,
+                embedding_model=Settings.EMBED_MODEL,
+                embedding_dimension=0,
+                status="rebuilding",
+            )
             logger.info("Force reindex: cleared existing index for %s", repo_path)
 
         files = list(indexer.walk_repo())
         total_files = len(files)
         processed_files = 0
         processed_chunks = 0
+        stored = skipped = failed = 0
         start_time = time.time()
 
         local_loop = asyncio.new_event_loop()
@@ -180,8 +195,14 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
                 parsed = chunk_file(file_path, repo_path, indexer.repo_id)
                 rel = parsed.rel_path
                 processed_chunks += len(parsed.chunks)
-                local_loop.run_until_complete(indexer.index_file(parsed))
+                counts = local_loop.run_until_complete(indexer.index_file(parsed))
+                stored += counts["stored"]
+                skipped += counts["skipped"]
+                failed += counts["failed"]
             except Exception as err:
+                # A file that could not be parsed or stored at all counts as a
+                # failure of every chunk it would have produced.
+                failed += max(1, len(parsed.chunks) if "parsed" in dir() else 1)
                 send({"type": "error", "message": str(err), "file": rel})
             finally:
                 # Count the file as processed even when it failed, so the
@@ -207,6 +228,12 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
             "total_files": total_files,
             "processed_files": processed_files,
             "total_chunks": processed_chunks,
+            # Real accumulated counts from the per-file diff. The previous
+            # implementation hardcoded "skipped": 0 with a comment claiming it
+            # was tracked elsewhere; it was not tracked at all.
+            "stored": stored,
+            "skipped": skipped,
+            "failed": failed,
             "duration_ms": duration,
         })
 
@@ -220,6 +247,8 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
         logger.exception("Indexing failed for %s", repo_path)
         send({"type": "error", "message": str(e), "file": "system"})
     finally:
+        with _active_lock:
+            _active_indexing.discard(repo_id)
         send(None)
 
 
@@ -253,21 +282,41 @@ def resolve_repo_id(repo_path: str | None) -> str:
 @app.post("/index")
 async def api_index(req: IndexRequest):
     if not os.path.exists(req.repo_path) or not os.path.isdir(req.repo_path):
-        raise HTTPException(status_code=400, detail="Target repo_path does not exist or is not a strictly defined directory.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"repo_path does not exist or is not a directory: {req.repo_path}",
+        )
+
+    repo_id = repo_id_for(req.repo_path)
+
+    # Reject a second concurrent index of the SAME repository. Two overlapping
+    # runs raced on the module-level global_indexer and interleaved writes to
+    # the same rows. Different repositories are allowed to proceed in parallel.
+    with _active_lock:
+        if repo_id in _active_indexing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An index of this repository is already running: {req.repo_path}",
+            )
+        _active_indexing.add(repo_id)
 
     q: asyncio.Queue = asyncio.Queue()
     main_loop = asyncio.get_running_loop()
-    
-    t = threading.Thread(target=indexer_worker, args=(req.repo_path, req.force_reindex, q, main_loop))
+
+    t = threading.Thread(
+        target=indexer_worker,
+        args=(req.repo_path, repo_id, req.force_reindex, q, main_loop),
+        daemon=True,
+    )
     t.start()
-    
+
     async def sse_gen():
         while True:
             event = await q.get()
             if event is None:
                 break
             yield f"data: {json.dumps(event)}\n\n"
-            
+
     return StreamingResponse(sse_gen(), media_type="text/event-stream")
 
 @app.post("/query", response_model=QueryResponse)

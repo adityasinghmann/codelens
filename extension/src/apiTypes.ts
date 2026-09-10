@@ -98,6 +98,12 @@ export interface IndexCompleteEvent {
     total_files: number;
     processed_files: number;
     total_chunks: number;
+    /** Chunks embedded and written this run. */
+    stored: number;
+    /** Chunks left alone because their content_hash was unchanged. */
+    skipped: number;
+    /** Chunks that could not be embedded or stored. */
+    failed: number;
     duration_ms: number;
 }
 
