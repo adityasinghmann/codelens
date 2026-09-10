@@ -69,6 +69,21 @@
     "configuration": {
       "title": "CodeLens",
       "properties": {
+        "codelens.pythonPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to a Python 3.10+ interpreter used to build the backend's virtual environment. Leave empty to search `PATH` and then the standard install locations for your platform."
+        },
+        "codelens.ollamaPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the `ollama` executable. Leave empty to search `PATH` and then the standard install locations for your platform. Only used to put Ollama on the backend's `PATH`; the backend itself talks to Ollama over HTTP at `#codelens.ollamaHost#`."
+        },
+        "codelens.ollamaHost": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Address of the Ollama server that generates embeddings."
+        },
         "codelens.port": {
           "type": "integer",
           "default": 8000,

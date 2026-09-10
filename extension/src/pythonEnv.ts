@@ -13,10 +13,12 @@
  */
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { getPythonSetting } from './config';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,24 +39,73 @@ export interface BackendEnv {
 
 const MIN_PYTHON: readonly [number, number] = [3, 10];
 
-/** Interpreter names to try, in order, when no explicit path is configured. */
-function candidateInterpreters(): string[] {
+/**
+ * An interpreter candidate is an argv prefix, not just a path, so the Windows
+ * `py -3` launcher can be a first-class option alongside plain executables.
+ */
+export type PythonCommand = string[];
+
+/** Interpreter names to look for on PATH, in preference order. */
+function pathCandidates(): PythonCommand[] {
     if (process.platform === 'win32') {
-        return ['python', 'python3', 'py'];
+        return [['py', '-3'], ['python'], ['python3']];
     }
-    return ['python3.12', 'python3.11', 'python3.10', 'python3', 'python'];
+    return [['python3.12'], ['python3.11'], ['python3.10'], ['python3'], ['python']];
+}
+
+/** Platform-specific default install locations, tried after PATH. */
+function defaultCandidates(): PythonCommand[] {
+    const home = os.homedir();
+    switch (process.platform) {
+        case 'darwin':
+            return [
+                ['/opt/homebrew/bin/python3'],
+                ['/usr/local/bin/python3.12'],
+                ['/usr/local/bin/python3.11'],
+                ['/usr/local/bin/python3.10'],
+                ['/usr/local/bin/python3'],
+                ['/usr/bin/python3'],
+            ];
+        case 'win32': {
+            const roots = [
+                path.join(process.env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local'), 'Programs', 'Python'),
+                'C:\\',
+                path.join(process.env.ProgramFiles ?? 'C:\\Program Files'),
+            ];
+            const found: PythonCommand[] = [];
+            for (const root of roots) {
+                let entries: string[];
+                try {
+                    entries = fs.readdirSync(root);
+                } catch {
+                    continue;
+                }
+                // Newest first, so Python313 beats Python310.
+                for (const entry of entries.filter((e) => /^Python3\d+$/i.test(e)).sort().reverse()) {
+                    found.push([path.join(root, entry, 'python.exe')]);
+                }
+            }
+            return found;
+        }
+        default:
+            return [['/usr/local/bin/python3'], ['/usr/bin/python3']];
+    }
 }
 
 /**
- * Return the "major.minor" version of `exe`, or null if it cannot be run or is
- * older than the minimum. Uses a real subprocess probe rather than trusting the
- * name on disk.
+ * Return the "major.minor" version reported by a command, or null if it cannot
+ * be run or is older than the minimum. Uses a real subprocess probe rather than
+ * trusting the name on disk.
  */
-async function probeInterpreter(exe: string): Promise<string | null> {
+async function probeInterpreter(command: PythonCommand): Promise<string | null> {
+    const [exe, ...prefix] = command;
+    if (path.isAbsolute(exe) && !fs.existsSync(exe)) {
+        return null;
+    }
     try {
         const { stdout } = await execFileAsync(
             exe,
-            ['-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
+            [...prefix, '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
             { timeout: 10000 },
         );
         const version = stdout.trim();
@@ -68,17 +119,36 @@ async function probeInterpreter(exe: string): Promise<string | null> {
     }
 }
 
-/** Find a Python >= 3.10 to build the venv from. */
-export async function resolveBasePython(): Promise<string> {
+/**
+ * Find a Python >= 3.10 to build the venv from, in the documented order:
+ * the `codelens.pythonPath` setting, then PATH, then platform defaults.
+ *
+ * An explicit setting that does not work is reported as such rather than
+ * silently falling through to a different interpreter.
+ */
+export async function resolveBasePython(explicit: string): Promise<PythonCommand> {
+    const min = `${MIN_PYTHON[0]}.${MIN_PYTHON[1]}`;
+
+    if (explicit) {
+        if (await probeInterpreter([explicit])) {
+            return [explicit];
+        }
+        throw new BackendSetupError(
+            `The interpreter configured in "codelens.pythonPath" is not usable: ${explicit} (it must exist and be Python ${min} or newer).`,
+            'Correct "codelens.pythonPath", or clear it to let CodeLens search PATH.',
+        );
+    }
+
     const tried: string[] = [];
-    for (const candidate of candidateInterpreters()) {
-        tried.push(candidate);
+    for (const candidate of [...pathCandidates(), ...defaultCandidates()]) {
+        tried.push(candidate.join(' '));
         if (await probeInterpreter(candidate)) {
             return candidate;
         }
     }
+
     throw new BackendSetupError(
-        `CodeLens could not find Python ${MIN_PYTHON[0]}.${MIN_PYTHON[1]} or newer (tried: ${tried.join(', ')}).`,
+        `CodeLens could not find Python ${min} or newer on ${process.platform} (tried: ${tried.join(', ')}).`,
         'Install Python 3.10+ and make sure it is on your PATH, or set "codelens.pythonPath" to the interpreter.',
     );
 }
@@ -131,8 +201,10 @@ export async function ensureBackendEnv(context: vscode.ExtensionContext): Promis
     }
     const requirementsText = fs.readFileSync(requirementsPath, 'utf-8');
 
-    const basePython = await resolveBasePython();
+    const basePython = await resolveBasePython(getPythonSetting());
     const pythonVersion = (await probeInterpreter(basePython)) ?? 'unknown';
+    const [baseExe, ...baseArgs] = basePython;
+    const baseLabel = basePython.join(' ');
 
     const storageDir = context.globalStorageUri.fsPath;
     fs.mkdirSync(storageDir, { recursive: true });
@@ -160,11 +232,11 @@ export async function ensureBackendEnv(context: vscode.ExtensionContext): Promis
         async (progress) => {
             progress.report({ message: 'creating virtual environment' });
             try {
-                await execFileAsync(basePython, ['-m', 'venv', venvDir], { timeout: 300000 });
+                await execFileAsync(baseExe, [...baseArgs, '-m', 'venv', venvDir], { timeout: 300000 });
             } catch (err) {
                 throw new BackendSetupError(
                     `Failed to create a Python virtual environment at ${venvDir}: ${describe(err)}`,
-                    `Check that "${basePython} -m venv" works, or set "codelens.pythonPath" to a different interpreter. On Debian/Ubuntu the python3-venv package may be missing.`,
+                    `Check that "${baseLabel} -m venv" works, or set "codelens.pythonPath" to a different interpreter. On Debian/Ubuntu the python3-venv package may be missing.`,
                 );
             }
 
