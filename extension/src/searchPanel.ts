@@ -48,7 +48,10 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
     private async handleQuery(text: string, explain: boolean) {
         try {
             // Native Axios bindings directly parsing localhost backend
-            const body: QueryRequest = { query: text, top_k: 8, explain };
+            // Scope the search to the open workspace so a backend that has
+            // indexed several repositories returns this one's code.
+            const workspace = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+            const body: QueryRequest = { query: text, top_k: 8, explain, repo_path: workspace };
             const res = await axios.post<QueryResponse>(`${apiUrl()}/query`, body);
             this._view?.webview.postMessage({
                 type: 'results',

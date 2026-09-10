@@ -17,34 +17,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from backend.config import Settings
-from backend.db_client import get_db
+from backend.db_client import get_db, repo_id_for
 from backend.indexer import Indexer, chunk_file
 from backend.query import run_query
 
 logger = logging.getLogger(__name__)
 
-SIDECAR_FILE = os.path.join(
-    os.path.dirname(Settings.INDEX_PATH) if os.path.dirname(Settings.INDEX_PATH) else ".",
-    "last_repo.json"
-)
+# The last_repo.json sidecar is gone: the repositories table is the record of
+# what has been indexed, and unlike the sidecar it can hold more than one.
 global_indexer: Indexer | None = None
-
-def get_last_repo() -> str | None:
-    if os.path.exists(SIDECAR_FILE):
-        try:
-            with open(SIDECAR_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("repo_path")
-        except Exception:
-            pass
-    return None
-
-def save_last_repo(path: str):
-    try:
-        with open(SIDECAR_FILE, "w", encoding="utf-8") as f:
-            json.dump({"repo_path": path, "last_indexed": datetime.now().isoformat()}, f)
-    except Exception as e:
-        logger.error(f"Failed to save sidecar tracker: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -68,10 +49,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Ollama status: offline (%s)", e)
 
-    last_repo = get_last_repo()
-    if last_repo and os.path.exists(last_repo) and os.path.isdir(last_repo):
-        logger.info("Restoring live file watcher for: %s", last_repo)
-        global_indexer = Indexer(last_repo)
+    recent = db.most_recent_repository()
+    if recent and os.path.isdir(recent["root_path"]):
+        logger.info("Restoring live file watcher for: %s", recent["root_path"])
+        global_indexer = Indexer(recent["root_path"])
         global_indexer.start_watchdog()
 
     yield
@@ -125,11 +106,16 @@ class QueryRequest(BaseModel):
     query: str
     top_k: int = Field(8, ge=1, le=20)
     explain: bool = False
+    # Which repository to search. Results are always scoped to exactly one
+    # repository; when omitted the most recently indexed one is used.
+    repo_path: str | None = None
 
 
 class QueryResult(BaseModel):
     """One search hit."""
     symbol_name: str
+    qualified_name: str = ""
+    symbol_type: str = ""
     file_path: str
     start_line: int
     end_line: int
@@ -151,6 +137,8 @@ class StatusResponse(BaseModel):
     """Body of the GET /status response."""
     indexed_chunks: int
     last_indexed: str | None
+    # Root of the repository these numbers describe, or null if none indexed.
+    repo_path: str | None
     db_path: str
     embed_model: str
     watching: bool
@@ -165,14 +153,18 @@ class HealthResponse(BaseModel):
 def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asyncio.AbstractEventLoop):
     def send(event: dict | None):
         asyncio.run_coroutine_threadsafe(q.put(event), main_loop)
-        
+
     try:
         indexer = Indexer(repo_path)
+        db = get_db()
+
         if force:
-            # Assuming db_client wrapper provides a clear/destroy mechanism natively
-            # Typically you'd truncate records referencing this path
-            pass 
-            
+            # Drop only THIS repository's files and chunks. Other repositories
+            # indexed by the same backend are untouched.
+            db.clear_repository_content(indexer.repo_id)
+            db.set_index_metadata(indexer.repo_id, status="rebuilding")
+            logger.info("Force reindex: cleared existing index for %s", repo_path)
+
         files = list(indexer.walk_repo())
         total_files = len(files)
         processed_files = 0
@@ -185,11 +177,10 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
         for file_path in files:
             rel = os.path.relpath(file_path, repo_path)
             try:
-                chunks = chunk_file(file_path, repo_path)
-                processed_chunks += len(chunks)
-
-                if chunks:
-                    local_loop.run_until_complete(indexer.embed_and_store(chunks))
+                parsed = chunk_file(file_path, repo_path, indexer.repo_id)
+                rel = parsed.rel_path
+                processed_chunks += len(parsed.chunks)
+                local_loop.run_until_complete(indexer.index_file(parsed))
             except Exception as err:
                 send({"type": "error", "message": str(err), "file": rel})
             finally:
@@ -206,7 +197,10 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
                 })
 
         local_loop.close()
-        
+
+        db.set_index_metadata(indexer.repo_id, status="ready")
+        db.touch_repository(indexer.repo_id)
+
         duration = int((time.time() - start_time) * 1000)
         send({
             "type": "complete",
@@ -215,16 +209,46 @@ def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asy
             "total_chunks": processed_chunks,
             "duration_ms": duration,
         })
-        
-        save_last_repo(repo_path)
+
         global global_indexer
+        if global_indexer is not None and global_indexer.repo_id != indexer.repo_id:
+            global_indexer.stop_watchdog()
         global_indexer = indexer
         global_indexer.start_watchdog()
-        
+
     except Exception as e:
+        logger.exception("Indexing failed for %s", repo_path)
         send({"type": "error", "message": str(e), "file": "system"})
     finally:
         send(None)
+
+
+def resolve_repo_id(repo_path: str | None) -> str:
+    """
+    Work out which repository a query targets.
+
+    Explicit repo_path wins. Without one, fall back to the most recently
+    indexed repository so a single-repo setup keeps working. Either way the
+    search is scoped to exactly one repo_id.
+    """
+    db = get_db()
+    if repo_path:
+        repo_id = repo_id_for(repo_path)
+        if db.get_repository(repo_id) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Repository has not been indexed yet: {repo_path}. Run indexing first.",
+            )
+        return repo_id
+
+    recent = db.most_recent_repository()
+    if recent is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No repository has been indexed yet. Run indexing first.",
+        )
+    return recent["repo_id"]
+
 
 @app.post("/index")
 async def api_index(req: IndexRequest):
@@ -249,47 +273,52 @@ async def api_index(req: IndexRequest):
 @app.post("/query", response_model=QueryResponse)
 async def api_query(req: QueryRequest):
     if not req.query.strip():
-         raise HTTPException(status_code=400, detail="Query payload empty.")
-         
+        raise HTTPException(status_code=400, detail="Query payload empty.")
+
+    repo_id = resolve_repo_id(req.repo_path)
+
     start_time = time.time()
     db = get_db()
-    
-    data = await run_query(req.query, top_k=req.top_k, explain=req.explain)
-    
+
+    data = await run_query(req.query, repo_id=repo_id, top_k=req.top_k, explain=req.explain)
+
     query_ts = int((time.time() - start_time) * 1000)
-    total_indexed = db.count()
-    
-    logger.info(f"Query: '{req.query}' | Results: {len(data['results'])} | Execution: {query_ts}ms")
-    
+    # Scoped to the repository actually searched, not the whole database.
+    total_indexed = db.count(repo_id)
+
+    logger.info(
+        "Query: %r | repo %s | results: %d | %dms",
+        req.query, repo_id[:8], len(data["results"]), query_ts,
+    )
+
     return {
         "results": data["results"],
         "explain_text": data.get("explain_text"),
         "query_ms": query_ts,
-        "total_indexed": total_indexed
+        "total_indexed": total_indexed,
     }
+
 
 @app.get("/status", response_model=StatusResponse)
 async def api_status():
     db = get_db()
-    
-    last_repo = get_last_repo()
-    last_indexed = None
-    
-    if os.path.exists(SIDECAR_FILE):
-        try:
-            with open(SIDECAR_FILE, "r", encoding="utf-8") as f:
-                file_data = json.load(f)
-                last_indexed = file_data.get("last_indexed")
-        except Exception:
-            pass
-            
+
+    # Report on the repository the watcher is attached to, falling back to the
+    # most recently indexed one.
+    if global_indexer is not None:
+        repo = db.get_repository(global_indexer.repo_id)
+    else:
+        repo = db.most_recent_repository()
+
     return {
-        "indexed_chunks": db.count(),
-        "last_indexed": last_indexed,
+        "indexed_chunks": db.count(repo["repo_id"]) if repo else 0,
+        "last_indexed": repo["updated_at"] if repo else None,
+        "repo_path": repo["root_path"] if repo else None,
         "db_path": Settings.INDEX_PATH,
         "embed_model": Settings.EMBED_MODEL,
-        "watching": global_indexer is not None and global_indexer.observer is not None
+        "watching": global_indexer is not None and global_indexer.observer is not None,
     }
+
 
 @app.get("/health", response_model=HealthResponse)
 async def api_health():
