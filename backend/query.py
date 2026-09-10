@@ -1,6 +1,7 @@
 """
-Query engine — embeds a natural-language question and does cosine ANN
-search against the VectorAI DB. Optional: summarise results via Mistral.
+Query engine - embeds a natural-language question and scores it against
+every stored chunk with exact cosine similarity. Optionally summarises the
+top results with a local chat model.
 
 Changes vs original:
  • ollama SDK 0.5+: resp.embedding (not resp['embedding'])
@@ -29,8 +30,8 @@ async def run_query(
 ) -> Dict[str, Any]:
     """
     1. Embed the query with the same model used during indexing.
-    2. ANN search the VectorAI DB (cosine similarity).
-    3. Optionally summarise with Mistral 7B.
+    2. Score it against every stored chunk (exact cosine similarity).
+    3. Optionally summarise the top hits with a local chat model.
     """
     client = _get_ollama_client()
 
@@ -44,7 +45,7 @@ async def run_query(
         logger.error(f"Failed to embed query: {e}")
         raise
 
-    # --- VectorAI DB ANN search ---
+    # --- Exact cosine search over the stored chunks ---
     db = get_db()
     raw_results = db.search(query_vec, top_k=top_k)
 
@@ -56,7 +57,7 @@ async def run_query(
         r["score"] = max(0.0, min(1.0, score))
         results.append(r)
 
-    # --- Optional Mistral explain ---
+    # --- Optional local-LLM explanation ---
     explanation: str | None = None
     if explain and results:
         context = "\n\n".join(r.get("chunk_text", "") for r in results[:3])
@@ -69,15 +70,15 @@ async def run_query(
             {"role": "user",   "content": f"Codebase context:\n{context}\n\nQuestion: {query}"},
         ]
         try:
-            chat_resp = await client.chat(model="mistral", messages=messages)
+            chat_resp = await client.chat(model=Settings.EXPLAIN_MODEL, messages=messages)
             # ollama SDK 0.5+: ChatResponse object
             if hasattr(chat_resp, "message"):
                 explanation = chat_resp.message.content
             else:
                 explanation = chat_resp["message"]["content"]
         except Exception as e:
-            logger.warning(f"Mistral explain failed (not critical): {e}")
-            explanation = "(Explain mode unavailable — is Mistral pulled?)"
+            logger.warning(f"Explain step failed (not critical): {e}")
+            explanation = f"(Explain mode unavailable - is the {Settings.EXPLAIN_MODEL} model pulled?)"
 
     return {"results": results, "explain_text": explanation}
 

@@ -41,8 +41,8 @@ if ! "$OLLAMA_BIN" list 2>/dev/null | grep -q "nomic-embed-text"; then
 fi
 ok "nomic-embed-text ready"
 
-# Init DB dir
-mkdir -p ./.vectorai_db
+# Init index dir
+mkdir -p ./.codelens_index
 
 # Start FastAPI backend
 echo ""
@@ -50,6 +50,6 @@ ok "Starting CodeLens backend on http://localhost:8000"
 echo "   POST /index  — index a repo"
 echo "   POST /query  — semantic search"
 echo "   GET  /status — chunk count + watcher status"
-echo "   GET  /health — ollama + db health"
+echo "   GET  /health — ollama + index health"
 echo ""
 exec "$PYTHON" -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload

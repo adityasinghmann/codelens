@@ -10,14 +10,12 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3+-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://typescriptlang.org)
 [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?style=flat-square&logo=visual-studio-code&logoColor=white)](https://code.visualstudio.com)
-[![Actian VectorAI](https://img.shields.io/badge/Actian-VectorAI%20DB-EE3A43?style=flat-square&logo=databricks&logoColor=white)](https://www.actian.com)
 [![Ollama](https://img.shields.io/badge/Ollama-nomic--embed--text-FFA500?style=flat-square)](https://ollama.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
-[![ARM Ready](https://img.shields.io/badge/ARM-Apple%20Silicon%20Ready-000000?style=flat-square&logo=apple&logoColor=white)](https://apple.com)
 
-**Type a question. Get the exact code. Jump to the line. No internet. No API keys. No compromise.**
+**Type a question. Get the exact code. Jump to the line. No internet. No API keys.**
 
-[Quick Start](#-one-command-setup) · [Architecture](#-architecture) · [Why VectorAI DB](#-why-actian-vectorai-db) · [Demo](#-demo)
+[Quick Start](#-one-command-setup) · [Architecture](#-architecture) · [The vector store](#-the-vector-store) · [Demo](#-demo)
 
 </div>
 
@@ -63,23 +61,23 @@ All of this runs **offline**. Close your WiFi. It still works.
 │                     LOCAL MACHINE — FULLY OFFLINE               │
 │                                                                  │
 │  ┌──────────────────────────────┐   ┌──────────────────────┐   │
-│  │      INDEXING PIPELINE       │   │   ACTIAN VECTORAI DB  │   │
-│  │   (runs once + on file save) │   │   (embedded, local)   │   │
+│  │      INDEXING PIPELINE       │   │   LOCAL VECTOR STORE  │   │
+│  │   (runs once + on file save) │   │   (SQLite, one file)  │   │
 │  │                              │   │                       │   │
 │  │  📁 File Walker              │   │  • chunk_text         │   │
 │  │     .py .ts .go .rs .java   │──▶│  • file_path          │   │
 │  │         │                    │   │  • line_start/end     │   │
 │  │         ▼                    │   │  • symbol_name        │   │
 │  │  🌳 AST Chunker (tree-sitter)│   │  • language           │   │
-│  │     functions, classes,      │   │  • commit_sha         │   │
-│  │     methods, interfaces      │   │  • embedding (768d)   │   │
+│  │     functions, classes,      │   │  • content_hash       │   │
+│  │     methods, interfaces      │   │  • embedding          │   │
 │  │         │                    │   │                       │   │
 │  │         ▼                    │   └──────────┬────────────┘   │
 │  │  🤖 Ollama Embedder          │              │                 │
 │  │     nomic-embed-text (~270MB)│◀─────────────┘                │
 │  │     runs 100% offline        │              │                 │
 │  └──────────────────────────────┘              │                 │
-│                                                │ ANN search      │
+│                                                │ exact cosine    │
 │  ┌──────────────────────────────┐              │ top-k results   │
 │  │      QUERY PIPELINE          │              │                 │
 │  │   (triggered by user)        │◀─────────────┘                │
@@ -104,44 +102,50 @@ All of this runs **offline**. Close your WiFi. It still works.
 
 | Pipeline | Trigger | What it does |
 |---|---|---|
-| **Indexing** | Once on setup, then auto on file save | Walks repo → AST chunking → embed → store in VectorAI DB |
-| **Query** | Every user search | Embed query → ANN search VectorAI DB → render ranked results |
+| **Indexing** | Once on setup, then auto on file save | Walks repo → AST chunking → embed → store in the local index |
+| **Query** | Every user search | Embed query → exact cosine scoring → render ranked results |
 
 ---
 
-## 🗄️ Why Actian VectorAI DB
+## 🗄️ The Vector Store
 
-> *This is the core engine. Not a cloud service. Not a managed SaaS. A portable, embeddable, local vector database that runs on any machine.*
+The index is **SQLite plus exact cosine similarity computed with numpy**. There
+is no external database, no server to run, and no network dependency: the whole
+index is one file on disk that you can copy, back up, or delete.
 
-This was the critical architectural decision. Here's the comparison we ran:
+**Why this and not a vector database?** The requirement was that the tool work
+fully offline on a developer's laptop with nothing else installed. SQLite ships
+with Python, so the store adds zero operational surface. At the scale one
+repository reaches, scoring every row is fast enough, and it is exactly correct
+rather than approximately correct.
 
-| Feature | **Actian VectorAI DB** | Chroma | Pinecone |
-|---|:---:|:---:|:---:|
-| **Works offline** | ✅ Always | ✅ Local mode | ❌ Cloud-only |
-| **Zero config** | ✅ File-based | ⚠️ Needs server | ❌ API key + account |
-| **ARM native** | ✅ M1/M2/M3/Pi | ⚠️ Varies | ❌ N/A |
-| **Embedded** | ✅ In-process | ⚠️ Client-server | ❌ Remote |
-| **Low latency ANN** | ✅ Sub-10ms local | ⚠️ Variable | ⚠️ Network bound |
-| **Portable** | ✅ Copy the dir | ⚠️ Export needed | ❌ Locked to cloud |
-| **Privacy** | ✅ Never leaves disk | ✅ Local mode | ❌ Data leaves machine |
-| **Hackathon viable** | ✅ One command | ⚠️ More setup | ❌ Billing required |
+**How search actually works.** Every embedding for the repository is read into
+one numpy matrix and scored against the query vector with a single
+matrix-vector product, then the top *k* are returned. This is an **exhaustive
+(exact) search, not an ANN index** - there is no HNSW, no IVF, no quantisation.
+Cost grows linearly with the number of indexed chunks. That is the honest
+trade, and it is the first thing that would need to change to scale much
+further.
 
-**The key insight**: Portability + embedded architecture + offline-first ANN search made VectorAI DB the *only* viable choice for a tool that must work on a developer's laptop with zero cloud dependency.
+The store sits behind a narrow interface (`VectorStore`), so a different
+backend could be substituted without touching the indexer or the query path.
+No such backend is implemented.
 
-When a developer runs `./setup.sh`, VectorAI DB initializes in `./.vectorai_db/`. It's a directory. You can copy it, back it up, and reproduce the exact index anywhere. That's not possible with any cloud vector database.
-
-### What VectorAI DB stores per chunk
+### What the store holds per chunk
 
 ```python
 {
-    "symbol_name":    "handle_db_exception",   # function/class name
-    "chunk_text":     "def handle_db_exception...",  # full source
-    "file_path":      "backend/db.py",          # relative path
-    "line_start":     42,                        # for jump-to-file
-    "line_end":       78,
-    "language":       "python",                  # parsed by tree-sitter
-    "content_hash":   "a3f1c9d...",             # for dedup/incremental index
-    "embedding":      [0.021, -0.134, ...]       # 768-dim vector
+    "chunk_id":     "…",                 # stable identity: repo + file + symbol
+    "symbol_name":  "handle_db_exception",
+    "qualified_name": "backend.db.handle_db_exception",
+    "symbol_type":  "function",
+    "chunk_text":   "def handle_db_exception…",
+    "file_path":    "backend/db.py",     # repository-relative
+    "start_line":   42,
+    "end_line":     78,
+    "language":     "python",
+    "content_hash": "a3f1c9d…",          # change detection, not identity
+    "embedding":    [0.021, -0.134, …],  # width comes from the model
 }
 ```
 
@@ -181,7 +185,7 @@ That's it. The script:
 2. Starts the Ollama service
 3. Pulls `nomic-embed-text` (~270 MB, one-time)
 4. Installs all Python dependencies
-5. Initializes the local VectorAI DB instance
+5. Initialises the local index directory
 6. Builds the VS Code extension
 
 Then launch the backend:
@@ -195,13 +199,13 @@ uvicorn backend.main:app --host 127.0.0.1 --port 8000
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| **Vector Database** | Actian VectorAI DB | Embedded local ANN search - the core engine |
+| **Vector store** | SQLite + numpy | Local, file-based; exact cosine similarity over stored embeddings |
 | **Embedding Model** | `nomic-embed-text` via Ollama | 768-dim code embeddings, fully offline |
 | **Code Parsing** | `tree-sitter` (6 languages) | AST-based semantic chunking |
 | **API Server** | FastAPI + Uvicorn | `POST /index`, `POST /query`, `GET /status` |
 | **File Watching** | `watchdog` | Auto-reindex on file save |
 | **IDE Integration** | VS Code Extension (TypeScript) | Sidebar UI, jump-to-file, status bar |
-| **Optional LLM** | Mistral 7B via Ollama | "Explain mode" — plain English summaries |
+| **Optional LLM** | A local chat model via Ollama (default `mistral`) | "Explain mode" — plain English summaries |
 | **Progress UI** | `rich` | Beautiful CLI progress bars during indexing |
 
 ---
@@ -264,14 +268,14 @@ probability and not a confidence.
 ### `GET /status`
 
 ```json
-{"indexed_chunks": 6104, "last_indexed": "2026-04-16T14:20:16", "db_path": "./.vectorai_db",
+{"indexed_chunks": 6104, "last_indexed": "2026-04-16T14:20:16", "db_path": "./.codelens_index",
  "embed_model": "nomic-embed-text", "watching": true}
 ```
 
 ### `GET /health`
 
 ```json
-{"ollama": true, "vectorai": true, "ollama_error": null}
+{"ollama": true, "index": true, "ollama_error": null}
 ```
 
 > The former `shared/types.py` and `shared/types.ts` declared a different
@@ -309,18 +313,6 @@ This means **re-indexing a large codebase after a single file edit takes millise
 
 ---
 
-## 🍎 ARM Native (Apple Silicon + Raspberry Pi)
-
-CodeLens was designed and tested on **Apple Silicon (M-series)** from day one. The entire stack:
-- `nomic-embed-text` via Ollama — native ARM binary
-- Actian VectorAI DB — ARM-compatible embedded instance
-- FastAPI/Uvicorn — architecture-agnostic Python
-- VS Code extension — platform-agnostic TypeScript
-
-No Rosetta. No emulation. No performance penalty.
-
----
-
 ## 🔒 Privacy by Design
 
 | What never leaves your machine |
@@ -341,10 +333,10 @@ CodeLens/
 ├── backend/                    # Python FastAPI backend
 │   ├── __init__.py
 │   ├── config.py               # Environment-based settings
-│   ├── db_client.py            # Actian VectorAI DB wrapper
+│   ├── db_client.py            # Local SQLite vector store
 │   ├── indexer.py              # File walker + AST chunker + embedder
 │   ├── main.py                 # FastAPI server (index/query/status/health)
-│   ├── query.py                # Query embedding + ANN search + explain mode
+│   ├── query.py                # Query embedding + exact cosine search + explain mode
 │   └── tree_sitter_parser.py   # Multi-language AST parsing utilities
 │
 ├── extension/                  # VS Code extension (TypeScript)

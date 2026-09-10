@@ -1,12 +1,19 @@
 """
-Actian VectorAI DB Adapter
---------------------------
-Persistent local vector store: SQLite for metadata + numpy cosine-similarity ANN.
-100% offline, ARM-native, zero cloud dependency.
+Local vector store
+------------------
+A SQLite-backed vector store with vectorised cosine similarity, chosen so the
+tool needs zero external services and works fully offline: the index is a
+single file on disk that can be copied, backed up or deleted.
 
-In a production Actian VectorAI DB deployment this layer would call the
-VectorAI DB SQL vector functions directly — the interface is intentionally
-identical so it's a one-line swap when the GA SDK ships.
+Search is EXACT, not approximate. Every row for the repository is read and
+scored; there is no approximate-nearest-neighbour index, and the code should
+not be described as ANN. That is a deliberate trade: exhaustive scoring is
+simple and exactly correct, and it is fast enough at the scale a single
+repository reaches. It is also the first thing that would need to change to
+scale much further.
+
+The class is kept behind a narrow interface so a different storage backend
+could be substituted later without touching the indexer or the query path.
 """
 
 import uuid
@@ -18,15 +25,18 @@ from typing import List, Dict, Any, Optional
 from backend.config import Settings
 
 
-class LocalVectorDB:
+class LocalVectorStore:
     """
-    VectorAI DB embedded adapter.
-    Stores chunk metadata + 768-dim embedding vectors in a local SQLite file.
-    Cosine-similarity search is fully vectorised via numpy — sub-10ms on ARM.
+    Stores chunk metadata and embedding vectors in a local SQLite file.
+
+    Scoring is a single numpy matrix-vector product over every stored
+    embedding, which is exact cosine similarity rather than an approximate
+    index. The embedding width is whatever the configured model produces; it is
+    not assumed to be any particular size.
     """
 
     def __init__(self):
-        self.path = Settings.VECTORAI_DB_PATH
+        self.path = Settings.INDEX_PATH
         os.makedirs(self.path, exist_ok=True)
         self.db_file = os.path.join(self.path, "codelens.db")
         self._init_schema()
@@ -104,14 +114,16 @@ class LocalVectorDB:
             conn.commit()
 
     # ------------------------------------------------------------------
-    # Read path — Cosine ANN
+    # Read path - exhaustive cosine similarity
     # ------------------------------------------------------------------
 
     def search(self, embedding: List[float], top_k: int = 10) -> List[Dict[str, Any]]:
         """
-        Vectorised cosine-similarity search.
-        Loads all embeddings into a numpy matrix and computes dot-products
-        in one BLAS call — typically <10ms for 10k chunks on Apple Silicon.
+        Exact cosine-similarity search over every stored chunk.
+
+        Reads all embeddings into one numpy matrix and scores them with a
+        single matrix-vector product. This is exhaustive, not approximate:
+        cost grows linearly with the number of indexed chunks.
         """
         query_vec = np.array(embedding, dtype=np.float32)
         q_norm = np.linalg.norm(query_vec)
@@ -157,12 +169,12 @@ class LocalVectorDB:
             return conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
 
 
-# Singleton — one DB connection pool per process
-_db_instance: Optional[LocalVectorDB] = None
+# Singleton - one store per process.
+_db_instance: Optional[LocalVectorStore] = None
 
 
-def get_db() -> LocalVectorDB:
+def get_db() -> LocalVectorStore:
     global _db_instance
     if _db_instance is None:
-        _db_instance = LocalVectorDB()
+        _db_instance = LocalVectorStore()
     return _db_instance

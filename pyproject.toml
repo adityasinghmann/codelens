@@ -1,7 +1,7 @@
 [project]
 name = "codelens-backend"
 version = "0.2.0"
-description = "Offline semantic codebase search powered by Actian VectorAI DB"
+description = "Offline semantic code search: tree-sitter chunking, local Ollama embeddings, SQLite vector store"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110.0",

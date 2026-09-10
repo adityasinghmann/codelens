@@ -2,7 +2,7 @@
 Tree-sitter multi-language AST parser  (tree-sitter >= 0.22 API)
 -----------------------------------------------------------------
 Extracts semantic code units (functions, classes, methods) as chunks
-for embedding into the VectorAI DB vector store.
+for embedding into the local vector store.
 
 FIX: tree-sitter 0.25.x returns None for Language.name on some grammars
      (typescript, java). We carry an explicit ext→name map instead.

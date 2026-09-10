@@ -1,7 +1,7 @@
 {
   "name": "codelens",
   "displayName": "CodeLens — Offline Semantic Search",
-  "description": "Natural-language semantic search for your codebase. 100% offline, powered by Actian VectorAI DB + Ollama.",
+  "description": "Natural-language semantic search for your codebase. Fully offline: tree-sitter chunking, local Ollama embeddings, local SQLite vector store.",
   "version": "0.2.0",
   "publisher": "nikhilmourya",
   "repository": {
