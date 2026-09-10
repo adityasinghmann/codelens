@@ -11,6 +11,7 @@ import os
 import hashlib
 import asyncio
 import logging
+import threading
 from typing import List, Generator, Dict, Any, NamedTuple, Optional
 
 from watchdog.events import FileSystemEventHandler
@@ -91,6 +92,7 @@ class Indexer:
         self.db = get_db()
         self.repo_id = self.db.ensure_repository(repo_path)
         self.observer: Optional[Observer] = None
+        self.worker: Optional["_IndexWorker"] = None
         self.ollama_client = AsyncClient(host=Settings.OLLAMA_HOST)
 
     def walk_repo(self) -> Generator[str, None, None]:
@@ -196,42 +198,191 @@ class Indexer:
         self.db.delete_file(self.repo_id, rel)
         logger.info("Removed <%s> from repo %s", rel, self.repo_id[:8])
 
-    def start_watchdog(self):
+    def start_watchdog(self, debounce_seconds: float = 0.5):
         if self.observer is not None:
             return
-        handler = RepoEventHandler(self)
+        self.worker = _IndexWorker(self, debounce_seconds=debounce_seconds)
+        self.worker.start()
+        handler = RepoEventHandler(self, self.worker)
         self.observer = Observer()
         self.observer.schedule(handler, self.repo_path, recursive=True)
         self.observer.start()
         logger.info(f"Watchdog watching: {self.repo_path}")
 
     def stop_watchdog(self):
-        if self.observer is None:
+        if self.observer is not None:
+            self.observer.stop()
+            self.observer.join(timeout=5)
+            self.observer = None
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker = None
+
+
+class _IndexWorker:
+    """
+    Serialises watcher-driven indexing onto one long-lived background loop.
+
+    Replaces the previous asyncio.run() per filesystem event, which built and
+    tore down an event loop inside the watchdog thread for every keystroke-save
+    and gave no ordering guarantee between overlapping events.
+
+    Two properties matter here:
+      - per-path debouncing, so one editor save (which typically emits several
+        events) causes one index pass, not several
+      - never two operations for the same path at once, which the single
+        consuming task guarantees by construction
+    """
+
+    def __init__(self, indexer: "Indexer", debounce_seconds: float = 0.5):
+        self.indexer = indexer
+        self.debounce = debounce_seconds
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._timers: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._started = threading.Event()
+
+    def start(self) -> None:
+        if self._thread is not None:
             return
-        self.observer.stop()
-        self.observer.join(timeout=5)
-        self.observer = None
+        self._thread = threading.Thread(target=self._run_loop, daemon=True,
+                                        name="codelens-index-worker")
+        self._thread.start()
+        self._started.wait(timeout=5)
+
+    def _run_loop(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._started.set()
+        self._loop.run_forever()
+
+    def stop(self) -> None:
+        with self._lock:
+            for handle in self._timers.values():
+                handle.cancel()
+            self._timers.clear()
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self._thread = None
+        self._loop = None
+
+    def submit(self, action: str, path: str) -> None:
+        """
+        Queue an action for a path, coalescing repeats within the debounce
+        window. A later event for the same path replaces the pending one, so a
+        create-then-modify burst resolves to a single index pass.
+        """
+        if self._loop is None:
+            return
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            pending = self._timers.pop(key, None)
+            if pending is not None:
+                pending.cancel()
+            timer = threading.Timer(self.debounce, self._dispatch, args=(key, action, path))
+            timer.daemon = True
+            self._timers[key] = timer
+            timer.start()
+
+    def _dispatch(self, key: str, action: str, path: str) -> None:
+        with self._lock:
+            self._timers.pop(key, None)
+        loop = self._loop
+        if loop is None:
+            return
+        # Hand the work to the single worker loop. Because there is exactly one
+        # consuming loop, two operations for the same file never overlap.
+        asyncio.run_coroutine_threadsafe(self._execute(action, path), loop)
+
+    async def _execute(self, action: str, path: str) -> None:
+        try:
+            if action == "remove":
+                self.indexer.remove_file(path)
+            else:
+                await self.indexer.reindex_file_async(path)
+        except Exception as e:
+            logger.error("Watcher %s failed for %s: %s", action, path, e)
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Run every pending debounced action now. Used by tests."""
+        with self._lock:
+            pending = list(self._timers.items())
+            self._timers.clear()
+        futures = []
+        for key, timer in pending:
+            timer.cancel()
+            args = getattr(timer, "args", None)
+            if args and self._loop is not None:
+                _, action, path = args
+                futures.append(asyncio.run_coroutine_threadsafe(
+                    self._execute(action, path), self._loop))
+        for fut in futures:
+            try:
+                fut.result(timeout=timeout)
+            except Exception as e:
+                logger.error("Flush failed: %s", e)
 
 
 class RepoEventHandler(FileSystemEventHandler):
-    def __init__(self, indexer: Indexer):
+    """
+    Turns filesystem events into index operations.
+
+    The previous handler implemented on_modified only, so deleted files kept
+    their chunks forever, new files were never indexed until something modified
+    them, and a rename left the old path orphaned and the new path absent.
+    """
+
+    def __init__(self, indexer: "Indexer", worker: "_IndexWorker"):
         self.indexer = indexer
+        self.worker = worker
 
     def _is_indexable(self, src_path: str) -> bool:
         ext = os.path.splitext(src_path)[1].lower()
         if ext not in LANGUAGES:
             return False
-        parts = src_path.split(os.sep)
+        parts = os.path.normpath(src_path).split(os.sep)
         return not any(ign in parts for ign in IGNORE_DIRS)
+
+    def _in_repo(self, path: str) -> bool:
+        """Guard against events for paths outside this indexer's repository."""
+        try:
+            root = os.path.realpath(self.indexer.repo_path)
+            return os.path.commonpath([root, os.path.realpath(path)]) == root
+        except (ValueError, OSError):
+            return False
+
+    def on_created(self, event):
+        if event.is_directory or not self._is_indexable(event.src_path):
+            return
+        if self._in_repo(event.src_path):
+            logger.info("File created: %s", event.src_path)
+            self.worker.submit("index", event.src_path)
 
     def on_modified(self, event):
         if event.is_directory or not self._is_indexable(event.src_path):
             return
-        logger.info(f"File changed: {event.src_path} - re-indexing")
-        self.reindex_safe(event.src_path)
+        if self._in_repo(event.src_path):
+            logger.info("File changed: %s", event.src_path)
+            self.worker.submit("index", event.src_path)
 
-    def reindex_safe(self, path: str):
-        try:
-            self.indexer.reindex_file(path)
-        except Exception as e:
-            logger.error(f"Re-index failed for {path}: {e}")
+    def on_deleted(self, event):
+        if event.is_directory or not self._is_indexable(event.src_path):
+            return
+        if self._in_repo(event.src_path):
+            logger.info("File deleted: %s", event.src_path)
+            self.worker.submit("remove", event.src_path)
+
+    def on_moved(self, event):
+        """A rename is a removal of the old path plus an index of the new one."""
+        if event.is_directory:
+            return
+        src, dest = event.src_path, event.dest_path
+        if self._is_indexable(src) and self._in_repo(src):
+            logger.info("File moved from: %s", src)
+            self.worker.submit("remove", src)
+        if self._is_indexable(dest) and self._in_repo(dest):
+            logger.info("File moved to: %s", dest)
+            self.worker.submit("index", dest)
