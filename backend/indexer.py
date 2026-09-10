@@ -133,6 +133,38 @@ class Indexer:
             return None
         return vector
 
+    async def _embed_many(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """
+        Embed many chunks with bounded concurrency.
+
+        The previous code looked batched but was not:
+            embeddings = [await self._embed_text(c) for c in batch]
+        That awaits each request before starting the next, so a 20-chunk
+        "batch" was 20 sequential HTTP round-trips.
+
+        Requests now run under asyncio.gather bounded by a Semaphore of
+        EMBED_CONCURRENCY. Concurrency is bounded rather than unbounded because
+        Ollama is one local process: firing hundreds of requests at it makes it
+        slower, not faster.
+
+        There is no retry here. _embed_text already swallows its own errors and
+        returns None, so a failure cannot raise into gather, cancel siblings, or
+        trigger a retry storm; each chunk is attempted exactly once per pass and
+        a failed one is simply not written, so the next pass picks it up.
+        """
+        semaphore = asyncio.Semaphore(Settings.EMBED_CONCURRENCY)
+
+        async def one(text: str) -> Optional[List[float]]:
+            async with semaphore:
+                return await self._embed_text(text)
+
+        results: List[Optional[List[float]]] = []
+        batch_size = Settings.EMBED_BATCH_SIZE
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start:start + batch_size]
+            results.extend(await asyncio.gather(*(one(t) for t in batch)))
+        return results
+
     def _check_dimension(self, vector: List[float]) -> int:
         """
         Reconcile an embedding's width against what this repository recorded.
@@ -220,8 +252,9 @@ class Indexer:
             keep_chunks: List[Dict[str, Any]] = []
             keep_vectors: List[List[float]] = []
 
-            for chunk in to_embed:
-                vector = await self._embed_text(chunk["chunk_text"])
+            vectors = await self._embed_many([c["chunk_text"] for c in to_embed])
+
+            for chunk, vector in zip(to_embed, vectors):
                 if vector is None:
                     # Dropped, never written. It will be retried on the next
                     # index because no row exists to make it look current.

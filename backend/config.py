@@ -27,3 +27,11 @@ class Settings:
 
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "512"))
     TOP_K: int = int(os.getenv("TOP_K", "10"))
+
+    # How many embedding requests may be in flight at once. Bounded on purpose:
+    # Ollama is a single local process and unbounded concurrency degrades it
+    # rather than helping.
+    EMBED_CONCURRENCY: int = max(1, int(os.getenv("EMBED_CONCURRENCY", "4")))
+
+    # Chunks handed to the embedder per batch.
+    EMBED_BATCH_SIZE: int = max(1, int(os.getenv("EMBED_BATCH_SIZE", "20")))
