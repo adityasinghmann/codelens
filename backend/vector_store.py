@@ -94,13 +94,15 @@ class VectorStore(Protocol):
 
     # -- read path ---------------------------------------------------------
 
-    def search(self, embedding: Sequence[float], repo_id: str,
-               top_k: int = 10) -> List[Dict[str, Any]]:
+    def search(self, embedding: Sequence[float], repo_id: str, top_k: int = 10,
+               language: Optional[str] = None, path_prefix: Optional[str] = None,
+               symbol_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Rank this repository's chunks against a query vector.
 
-        repo_id is mandatory: there is no unscoped search. Results are ordered
-        by descending similarity and carry a `score`, which is a similarity in
+        repo_id is mandatory: there is no unscoped search. Optional filters
+        narrow the candidate set before scoring. Results are ordered by
+        descending similarity and carry a `score`, which is a similarity in
         [0, 1] - never a probability or a confidence.
         """
 

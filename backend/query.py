@@ -38,6 +38,9 @@ async def run_query(
     repo_id: str,
     top_k: int = 10,
     explain: bool = False,
+    language: str | None = None,
+    path_prefix: str | None = None,
+    symbol_type: str | None = None,
 ) -> Dict[str, Any]:
     """
     1. Embed the query with the same model used during indexing.
@@ -77,7 +80,14 @@ async def run_query(
             f"was built with {indexed_dim}. Re-index this repository."
         )
 
-    raw_results = db.search(query_vec, repo_id=repo_id, top_k=top_k)
+    raw_results = db.search(
+        query_vec,
+        repo_id=repo_id,
+        top_k=top_k,
+        language=language,
+        path_prefix=path_prefix,
+        symbol_type=symbol_type,
+    )
 
     # Normalise scores to [0, 1]
     results = []
@@ -113,6 +123,7 @@ async def run_query(
     return {"results": results, "explain_text": explanation}
 
 
-def run_query_sync(query: str, repo_id: str, top_k: int = 10, explain: bool = False) -> Dict[str, Any]:
+def run_query_sync(query: str, repo_id: str, top_k: int = 10,
+                   explain: bool = False, **filters) -> Dict[str, Any]:
     """Synchronous wrapper for CLI usage."""
-    return asyncio.run(run_query(query, repo_id, top_k, explain))
+    return asyncio.run(run_query(query, repo_id, top_k, explain, **filters))

@@ -31,6 +31,13 @@ export interface QueryRequest {
      * repository; omitting this searches the most recently indexed one.
      */
     repo_path?: string;
+
+    /** Restrict to one language, e.g. "python". */
+    language?: string;
+    /** Restrict to a repository-relative path prefix, e.g. "backend/". */
+    path_prefix?: string;
+    /** Restrict to one symbol kind, e.g. "method". */
+    symbol_type?: string;
 }
 
 /** One search hit. */

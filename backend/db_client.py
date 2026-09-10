@@ -500,13 +500,25 @@ class LocalVectorStore:
 
     # -- read path ---------------------------------------------------------
 
-    def search(self, embedding: Sequence[float], repo_id: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    def search(self, embedding: Sequence[float], repo_id: str, top_k: int = 10,
+               language: Optional[str] = None, path_prefix: Optional[str] = None,
+               symbol_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Exact cosine-similarity search within ONE repository.
 
         repo_id is mandatory. The previous implementation had a single global
         chunks table with no repo dimension, so indexing repo A and then
         searching from repo B returned A's code.
+
+        Optional filters are applied in SQL, before any scoring, so an
+        excluded chunk is never read or multiplied.
+
+        Two costs the earlier version paid needlessly:
+          * it SELECTed chunk_text for every row purely to score it, then threw
+            all but top_k away. Scoring now reads only (chunk_id, embedding) and
+            the winners are hydrated afterwards.
+          * it fully sorted N scores with argsort to keep 8. np.argpartition
+            finds the top_k in linear time and only those are sorted.
         """
         query_vec = np.asarray(embedding, dtype=np.float32)
         q_norm = np.linalg.norm(query_vec)
@@ -514,52 +526,87 @@ class LocalVectorStore:
             return []
         query_vec = query_vec / q_norm
 
+        where = ["repo_id = ?"]
+        params: List[Any] = [repo_id]
+        if language:
+            where.append("language = ?")
+            params.append(language)
+        if symbol_type:
+            where.append("symbol_type = ?")
+            params.append(symbol_type)
+        if path_prefix:
+            prefix = normalize_rel_path(path_prefix)
+            # LIKE with an escaped prefix; the index on (repo_id, file_path)
+            # makes this a range scan rather than a table scan.
+            where.append("file_path LIKE ? ESCAPE '\\'")
+            params.append(prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+
+        clause = " AND ".join(where)
+
+        # Phase 1: score against ids and vectors only.
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT symbol_name, chunk_text, file_path, start_line, end_line, language, "
-                "       embedding, qualified_name, symbol_type "
-                "FROM chunks WHERE repo_id = ?",
-                (repo_id,),
+                f"SELECT chunk_id, embedding FROM chunks WHERE {clause}", params
             ).fetchall()
 
         if not rows:
             return []
 
         width = len(query_vec)
-        usable, blobs = [], []
-        for row in rows:
-            # A row whose width does not match the query cannot be scored. This
-            # only happens if the embedding model changed without a re-index;
-            # the query layer refuses that case up front, so skip defensively.
-            if len(row[6]) != width * 4:
+        ids, blobs = [], []
+        for chunk_id, blob in rows:
+            # A row whose width does not match the query cannot be scored. That
+            # only happens if the model changed without a re-index; the query
+            # layer refuses that case up front, so skip defensively here.
+            if len(blob) != width * 4:
                 continue
-            usable.append(row)
-            blobs.append(row[6])
+            ids.append(chunk_id)
+            blobs.append(blob)
 
-        if not usable:
+        if not ids:
             return []
 
-        emb_matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(len(usable), width)
+        emb_matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(len(ids), width)
         norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1.0, norms)
         scores = (emb_matrix / norms) @ query_vec
 
-        top_indices = np.argsort(scores)[::-1][:top_k]
+        k = min(top_k, len(scores))
+        if k < len(scores):
+            candidates = np.argpartition(scores, -k)[-k:]
+        else:
+            candidates = np.arange(len(scores))
+        top_indices = candidates[np.argsort(scores[candidates])[::-1]]
 
-        return [
-            {
-                "symbol_name": usable[i][0],
-                "chunk_text": usable[i][1],
-                "file_path": usable[i][2],
-                "start_line": usable[i][3],
-                "end_line": usable[i][4],
-                "language": usable[i][5],
-                "qualified_name": usable[i][7],
-                "symbol_type": usable[i][8],
-                "score": float(scores[i]),
-            }
-            for i in top_indices
-        ]
+        # Phase 2: hydrate only the winners.
+        winners = [ids[i] for i in top_indices]
+        placeholders = ",".join("?" * len(winners))
+        with self._conn() as conn:
+            hydrated = conn.execute(
+                "SELECT chunk_id, symbol_name, qualified_name, symbol_type, file_path, "
+                "       start_line, end_line, language, chunk_text "
+                f"FROM chunks WHERE chunk_id IN ({placeholders})",
+                winners,
+            ).fetchall()
+
+        by_id = {row[0]: row for row in hydrated}
+        results: List[Dict[str, Any]] = []
+        for index in top_indices:
+            row = by_id.get(ids[index])
+            if row is None:
+                continue  # deleted between the two queries
+            results.append({
+                "symbol_name": row[1],
+                "qualified_name": row[2],
+                "symbol_type": row[3],
+                "file_path": row[4],
+                "start_line": row[5],
+                "end_line": row[6],
+                "language": row[7],
+                "chunk_text": row[8],
+                "score": float(scores[index]),
+            })
+        return results
 
     def count(self, repo_id: Optional[str] = None) -> int:
         with self._conn() as conn:
