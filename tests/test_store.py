@@ -1,5 +1,6 @@
 """LocalVectorStore: persistence, scoping, ranking and schema migration."""
 
+import os
 import sqlite3
 
 import pytest
@@ -325,3 +326,20 @@ def test_reopening_a_current_database_preserves_its_contents(index_dir, tmp_path
     reopened = LocalVectorStore(path=index_dir)
     assert reopened.count(repo_id) == 1
     assert reopened.get_repository(repo_id) is not None
+
+
+def test_stored_root_path_keeps_the_users_casing(store, tmp_path):
+    """
+    repo_id is case-folded for identity, but the path shown in /status must
+    not come back lowercased on Windows.
+    """
+    root = tmp_path / "MixedCase" / "RepoName"
+    root.mkdir(parents=True)
+
+    repo_id = store.ensure_repository(str(root))
+    stored = store.get_repository(repo_id)["root_path"]
+
+    assert "MixedCase" in stored
+    assert "RepoName" in stored
+    # Identity is still case-insensitive on platforms where that matters.
+    assert repo_id_for(str(root).lower()) == repo_id_for(str(root).upper()) or os.name != "nt"

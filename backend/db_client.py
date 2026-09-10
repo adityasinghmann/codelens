@@ -66,15 +66,26 @@ def _sha1(*parts: str) -> str:
     return h.hexdigest()
 
 
+def display_root(path: str) -> str:
+    """
+    Resolved repository root with the user's original casing preserved.
+
+    This is what gets stored and shown back. Identity uses normalize_root();
+    displaying that would print a lowercased path on Windows, which looks wrong
+    even though it is the correct key.
+    """
+    return os.path.realpath(os.path.abspath(path))
+
+
 def normalize_root(path: str) -> str:
     """
-    Canonical form of a repository root.
+    Canonical form of a repository root, used for identity only.
 
     Resolves symlinks and relative segments, then applies normcase so that on
     Windows C:\\Repo and c:\\repo are the same repository. This is what makes
     repo_id stable across however the user happened to type the path.
     """
-    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    return os.path.normcase(display_root(path))
 
 
 def repo_id_for(root_path: str) -> str:
@@ -264,14 +275,15 @@ class LocalVectorStore:
     def ensure_repository(self, root_path: str) -> str:
         """Register a repository (idempotent) and return its repo_id."""
         repo_id = repo_id_for(root_path)
-        normalized = normalize_root(root_path)
+        # Identity is case-folded; the stored path keeps the user's casing.
+        display = display_root(root_path)
         now = _now()
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO repositories (repo_id, root_path, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at",
-                (repo_id, normalized, now, now),
+                (repo_id, display, now, now),
             )
             conn.commit()
         return repo_id
