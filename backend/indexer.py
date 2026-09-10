@@ -115,29 +115,65 @@ class Indexer:
 
     async def index_file(self, parsed: ParsedFile) -> Dict[str, int]:
         """
-        Store one parsed file's chunks under this repository.
+        Reconcile one file's chunks against what is already stored.
 
-        Returns counts of {stored, skipped, failed}.
+        This is a real diff, not a delete-and-re-embed. For each chunk_id:
+
+          in both, content_hash equal  -> keep the embedding, update lines only
+          in both, content_hash differs-> re-embed, update in place
+          new chunk_id                 -> embed and insert
+          stored but no longer present -> delete
+
+        Embedding is the expensive step (a network round-trip per chunk), so
+        the whole point is that an unchanged chunk is never re-embedded, even
+        when the edit moved it.
+
+        Returns counts of {stored, skipped, deleted, failed}.
         """
         file_id = self.db.upsert_file(
             self.repo_id, parsed.rel_path, parsed.content_hash, parsed.language
         )
 
-        # Replace this file's chunks wholesale. Task 9 turns this into a real
-        # per-chunk diff; the identity work it needs is already in place here.
-        existing = self.db.get_chunks_for_file(file_id)
-        if existing:
-            self.db.delete_chunks(list(existing.keys()))
+        stored_chunks = self.db.get_chunks_for_file(file_id)
+        current = {c["chunk_id"]: c for c in parsed.chunks}
 
-        if not parsed.chunks:
-            return {"stored": 0, "skipped": 0, "failed": 0}
+        to_embed: List[Dict[str, Any]] = []
+        line_updates: List[Dict[str, Any]] = []
+        skipped = 0
 
-        embeddings = []
-        for chunk in parsed.chunks:
-            embeddings.append(await self._embed_text(chunk["chunk_text"]))
+        for chunk_id, chunk in current.items():
+            existing = stored_chunks.get(chunk_id)
+            if existing is None:
+                to_embed.append(chunk)
+            elif existing["content_hash"] != chunk["content_hash"]:
+                to_embed.append(chunk)
+            else:
+                # Unchanged: keep the vector, but the symbol may have moved.
+                skipped += 1
+                if (existing["start_line"] != chunk.get("start_line")
+                        or existing["end_line"] != chunk.get("end_line")):
+                    line_updates.append({
+                        "chunk_id": chunk_id,
+                        "start_line": chunk.get("start_line", 0),
+                        "end_line": chunk.get("end_line", 0),
+                    })
 
-        self.db.upsert_chunks(self.repo_id, file_id, parsed.chunks, embeddings)
-        return {"stored": len(parsed.chunks), "skipped": 0, "failed": 0}
+        removed = [cid for cid in stored_chunks if cid not in current]
+
+        if removed:
+            self.db.delete_chunks(removed)
+        if line_updates:
+            self.db.update_chunk_lines(line_updates)
+
+        stored = failed = 0
+        if to_embed:
+            embeddings = []
+            for chunk in to_embed:
+                embeddings.append(await self._embed_text(chunk["chunk_text"]))
+            self.db.upsert_chunks(self.repo_id, file_id, to_embed, embeddings)
+            stored = len(to_embed)
+
+        return {"stored": stored, "skipped": skipped, "deleted": len(removed), "failed": failed}
 
     async def embed_and_store(self, parsed: ParsedFile) -> Dict[str, int]:
         """Backwards-compatible name used by the API worker."""
