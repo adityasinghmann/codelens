@@ -3,6 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import axios from 'axios';
 import * as http from 'http';
+import { apiUrl } from './config';
+import { SseParser, parseJsonEvent, SseEvent } from './sseParser';
 
 export class SearchPanelProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -45,7 +47,7 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
     private async handleQuery(text: string, explain: boolean) {
         try {
             // Native Axios bindings directly parsing localhost backend
-            const res = await axios.post(`http://127.0.0.1:8000/query`, {
+            const res = await axios.post(`${apiUrl()}/query`, {
                 query: text,
                 top_k: 8,
                 explain: explain
@@ -70,53 +72,115 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
         }
 
         const payload = JSON.stringify({ repo_path: workspaceDir, force_reindex: true });
-        
-        // Native http mapping capturing raw text/event-stream signals from Uvicorn without Axios block mapping abstractions
-        const req = http.request('http://127.0.0.1:8000/index', {
+        const parser = new SseParser();
+        // Tracks whether the backend told us it finished. If the socket closes
+        // without a 'complete' event, the index was truncated and the user must
+        // hear about it rather than watching a progress bar stall forever.
+        let sawComplete = false;
+
+        const req = http.request(`${apiUrl()}/index`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(payload)
             }
         }, (res) => {
-            res.on('data', (bufferChunk) => {
-                const events = bufferChunk.toString().split('\n\n');
-                
-                for (const ev of events) {
-                    if (ev.startsWith('data: ')) {
-                        try {
-                            const parsed = JSON.parse(ev.substring(6));
-                            if(parsed.type === "progress") {
-                                // Maps exactly onto the Webview message protocol specified
-                                this._view?.webview.postMessage({
-                                    type: 'indexProgress',
-                                    file: parsed.file,
-                                    pct: (parsed.chunks / Math.max(1, parsed.total_files)) * 100,
-                                    message: `${parsed.chunks} chunks found`
-                                });
-                            } else if (parsed.type === "complete") {
-                                this._view?.webview.postMessage({
-                                    type: 'status',
-                                    chunks: parsed.total_chunks,
-                                    watching: true
-                                });
-                            } else if (parsed.type === "error") {
-                                this._view?.webview.postMessage({ type: 'error', message: parsed.message });
-                            }
-                        } catch (e) {
-                            // Ignored partial streaming fragments
-                        }
+            // A non-2xx response is a JSON error body, not an event stream.
+            if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+                let body = '';
+                res.setEncoding('utf-8');
+                res.on('data', (c) => { body += c; });
+                res.on('end', () => {
+                    let detail = body.trim();
+                    try {
+                        const parsedBody = JSON.parse(body);
+                        detail = parsedBody.detail ?? parsedBody.error ?? detail;
+                    } catch {
+                        // Not JSON; fall back to the raw body text.
+                    }
+                    this.postError(`Indexing failed (HTTP ${res.statusCode}): ${detail || 'no detail returned'}`);
+                });
+                return;
+            }
+
+            res.setEncoding('utf-8');
+            res.on('data', (chunk) => {
+                for (const event of parser.push(chunk)) {
+                    if (this.dispatchIndexEvent(event)) {
+                        sawComplete = true;
                     }
                 }
             });
+
+            res.on('end', () => {
+                // Flush any final event the server did not terminate with a
+                // blank line before closing.
+                for (const event of parser.flush()) {
+                    if (this.dispatchIndexEvent(event)) {
+                        sawComplete = true;
+                    }
+                }
+                if (!sawComplete) {
+                    this.postError('The indexing stream ended before the backend reported completion. The index may be incomplete - try re-indexing.');
+                }
+            });
+
+            res.on('error', (err) => {
+                this.postError(`The indexing stream failed: ${err.message}`);
+            });
         });
-        
-        req.on('error', (e) => {
-             this._view?.webview.postMessage({ type: 'error', message: 'Failed maintaining local index SSE connection.' });
+
+        req.on('error', (err) => {
+            this.postError(`Could not reach the CodeLens backend at ${apiUrl()}: ${err.message}`);
         });
-        
+
         req.write(payload);
         req.end();
+    }
+
+    /**
+     * Turn one SSE event into a webview message.
+     * Returns true if this was the terminal 'complete' event.
+     */
+    private dispatchIndexEvent(event: SseEvent): boolean {
+        const parsed = parseJsonEvent<any>(event);
+        if (!parsed.ok) {
+            // Log rather than swallow: a malformed payload is a backend bug and
+            // silently dropping it is what hid the old parser's data loss.
+            console.error(`[CodeLens] Discarding malformed SSE payload (${parsed.failure.error}): ${parsed.failure.data}`);
+            return false;
+        }
+
+        const message = parsed.value;
+        switch (message.type) {
+            case 'progress':
+                this._view?.webview.postMessage({
+                    type: 'indexProgress',
+                    file: message.file,
+                    pct: (message.chunks / Math.max(1, message.total_files)) * 100,
+                    message: `${message.chunks} chunks found`
+                });
+                return false;
+            case 'complete':
+                this._view?.webview.postMessage({
+                    type: 'status',
+                    chunks: message.total_chunks,
+                    watching: true
+                });
+                return true;
+            case 'error':
+                this.postError(message.file && message.file !== 'system'
+                    ? `${message.file}: ${message.message}`
+                    : message.message);
+                return false;
+            default:
+                console.warn(`[CodeLens] Ignoring unknown index event type: ${JSON.stringify(message.type)}`);
+                return false;
+        }
+    }
+
+    private postError(message: string) {
+        this._view?.webview.postMessage({ type: 'error', message });
     }
 
     private async handleJumpTo(file: string, line: number) {
