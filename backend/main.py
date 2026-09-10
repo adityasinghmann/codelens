@@ -7,6 +7,8 @@ import threading
 from datetime import datetime
 from contextlib import asynccontextmanager
 
+import httpx
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from backend.config import Settings
-from backend.db_client import get_db, repo_id_for
+from backend.db_client import get_db, repo_id_for, normalize_root
 from backend.indexer import Indexer, chunk_file
 from backend.query import run_query, EmbeddingModelMismatch
 
@@ -34,6 +36,50 @@ global_indexer: Indexer | None = None
 _active_indexing: set[str] = set()
 _active_lock = threading.Lock()
 
+async def probe_ollama(timeout: float = 1.5) -> tuple[bool, str | None]:
+    """
+    Check that Ollama answers, without blocking the event loop.
+
+    Both the health endpoint and lifespan startup previously called
+    urllib.request.urlopen() inside async functions. That is a synchronous
+    socket call: for the length of its timeout it blocked the whole event loop,
+    so with Ollama down every /health request stalled every other request the
+    server was handling.
+    """
+    url = f"{Settings.OLLAMA_HOST}/api/tags"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            await client.get(url)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def validate_repo_path(raw: str) -> str:
+    """
+    Resolve and validate a caller-supplied repository path.
+
+    Returns the normalised absolute path. Raises HTTPException(400) if it is
+    empty, does not exist, or is not a directory. The previous code checked
+    existence but never normalised, so the same repository reached the store
+    under several spellings.
+    """
+    if not raw or not raw.strip():
+        raise HTTPException(status_code=400, detail="repo_path must not be empty.")
+
+    try:
+        resolved = os.path.realpath(os.path.abspath(os.path.expanduser(raw.strip())))
+    except (OSError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"repo_path could not be resolved: {e}")
+
+    if not os.path.exists(resolved):
+        raise HTTPException(status_code=400, detail=f"repo_path does not exist: {resolved}")
+    if not os.path.isdir(resolved):
+        raise HTTPException(status_code=400, detail=f"repo_path is not a directory: {resolved}")
+
+    return resolved
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global global_indexer
@@ -49,12 +95,11 @@ async def lifespan(app: FastAPI):
     logger.info("Index path: %s", Settings.INDEX_PATH)
     logger.info("Total chunks in index: %d", db.count())
 
-    import urllib.request
-    try:
-        urllib.request.urlopen(f"{Settings.OLLAMA_HOST}/api/tags", timeout=2)
+    reachable, err = await probe_ollama(timeout=2.0)
+    if reachable:
         logger.info("Ollama status: online")
-    except Exception as e:
-        logger.warning("Ollama status: offline (%s)", e)
+    else:
+        logger.warning("Ollama status: offline (%s)", err)
 
     recent = db.most_recent_repository()
     if recent and os.path.isdir(recent["root_path"]):
@@ -70,12 +115,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CodeLens Offline Core", lifespan=lifespan)
 
+# The backend binds 127.0.0.1 and serves exactly one client: the extension's
+# webview. VS Code webviews send Origin: vscode-webview://<uuid>, and requests
+# from the extension host itself carry no Origin at all (and so are unaffected
+# by CORS). allow_origins=["*"] on a loopback service let any web page the user
+# visited probe and read this API; the regex below is the narrowest rule that
+# still works for the real client.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"^vscode-webview://.*$",
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 @app.exception_handler(Exception)
@@ -280,13 +331,8 @@ def resolve_repo_id(repo_path: str | None) -> str:
 
 @app.post("/index")
 async def api_index(req: IndexRequest):
-    if not os.path.exists(req.repo_path) or not os.path.isdir(req.repo_path):
-        raise HTTPException(
-            status_code=400,
-            detail=f"repo_path does not exist or is not a directory: {req.repo_path}",
-        )
-
-    repo_id = repo_id_for(req.repo_path)
+    repo_path = validate_repo_path(req.repo_path)
+    repo_id = repo_id_for(repo_path)
 
     # Reject a second concurrent index of the SAME repository. Two overlapping
     # runs raced on the module-level global_indexer and interleaved writes to
@@ -304,7 +350,7 @@ async def api_index(req: IndexRequest):
 
     t = threading.Thread(
         target=indexer_worker,
-        args=(req.repo_path, repo_id, req.force_reindex, q, main_loop),
+        args=(repo_path, repo_id, req.force_reindex, q, main_loop),
         daemon=True,
     )
     t.start()
@@ -375,16 +421,8 @@ async def api_status():
 
 @app.get("/health", response_model=HealthResponse)
 async def api_health():
-    import urllib.request
-    ollama_ok = False
-    ollama_err = None
-    
-    try:
-        urllib.request.urlopen(f"{Settings.OLLAMA_HOST}/api/tags", timeout=1)
-        ollama_ok = True
-    except Exception as e:
-        ollama_err = str(e)
-        
+    ollama_ok, ollama_err = await probe_ollama(timeout=1.5)
+
     db_ok = False
     db_dir = os.path.dirname(Settings.INDEX_PATH)
     if os.path.exists(Settings.INDEX_PATH) or (db_dir and os.path.exists(db_dir)):
