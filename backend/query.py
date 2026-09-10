@@ -25,6 +25,7 @@ def _get_ollama_client() -> AsyncClient:
 
 async def run_query(
     query: str,
+    repo_id: str,
     top_k: int = 10,
     explain: bool = False,
 ) -> Dict[str, Any]:
@@ -47,7 +48,7 @@ async def run_query(
 
     # --- Exact cosine search over the stored chunks ---
     db = get_db()
-    raw_results = db.search(query_vec, top_k=top_k)
+    raw_results = db.search(query_vec, repo_id=repo_id, top_k=top_k)
 
     # Normalise scores to [0, 1]
     results = []
@@ -83,6 +84,6 @@ async def run_query(
     return {"results": results, "explain_text": explanation}
 
 
-def run_query_sync(query: str, top_k: int = 10, explain: bool = False) -> Dict[str, Any]:
+def run_query_sync(query: str, repo_id: str, top_k: int = 10, explain: bool = False) -> Dict[str, Any]:
     """Synchronous wrapper for CLI usage."""
-    return asyncio.run(run_query(query, top_k, explain))
+    return asyncio.run(run_query(query, repo_id, top_k, explain))

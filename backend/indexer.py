@@ -2,26 +2,26 @@
 Indexer - walks a repo, AST-chunks files, embeds with Ollama,
 and upserts into the local SQLite vector store.
 
-Changes vs original:
- • tree-sitter 0.22+ API (Language one-arg, Parser(language))
- • ollama 0.5+ SDK: response is an object, not a dict (.embedding not ['embedding'])
- • Uses tree_sitter_parser.extract_chunks / _sliding_window exclusively
- • Point.row instead of tuple indexing for start/end
+Everything here is scoped to a repository. The store keys files and chunks by
+repo_id, so two repositories indexed by the same backend never see each
+other's code.
 """
 
 import os
 import hashlib
 import asyncio
 import logging
-from typing import List, Generator, Dict, Any
-from pathlib import Path
+from typing import List, Generator, Dict, Any, NamedTuple, Optional
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
-from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from ollama import AsyncClient
 
-from backend.db_client import get_db
+from backend.db_client import (
+    get_db,
+    assign_chunk_ids,
+    normalize_rel_path,
+)
 from backend.config import Settings
 from backend.tree_sitter_parser import LANGUAGES, extract_chunks, _sliding_window
 
@@ -38,38 +38,59 @@ def md5_hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
-def chunk_file(file_path: str, repo_root: str) -> List[Dict[str, Any]]:
-    """Read one file, run AST chunking, attach content_hash to every chunk."""
+class ParsedFile(NamedTuple):
+    """One file's parse result, ready to be diffed against the store."""
+    rel_path: str
+    language: str
+    #  Hash of the whole file - cheap "did anything change at all?" check.
+    content_hash: str
+    chunks: List[Dict[str, Any]]
+
+
+def chunk_file(file_path: str, repo_root: str, repo_id: str) -> ParsedFile:
+    """
+    Read one file, AST-chunk it, and give every chunk a stable identity.
+
+    Two hashes are produced and they mean different things:
+      - ParsedFile.content_hash is the whole file, for skipping untouched files
+      - chunk["content_hash"] is that chunk's text, for detecting which
+        individual symbols changed
+    Identity itself is chunk["chunk_id"], which is independent of both.
+    """
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except Exception as e:
         logger.warning(f"Could not read {file_path}: {e}")
-        return []
+        return ParsedFile(normalize_rel_path(os.path.relpath(file_path, repo_root)), "", "", [])
+
+    rel_path = normalize_rel_path(os.path.relpath(file_path, repo_root))
+    ext = os.path.splitext(file_path)[1].lower()
 
     if not content.strip():
-        return []
-
-    rel_path = os.path.relpath(file_path, repo_root)
-    ext = os.path.splitext(file_path)[1].lower()
+        return ParsedFile(rel_path, "", md5_hash(content), [])
 
     if ext in LANGUAGES:
         raw_chunks = extract_chunks(rel_path, content)
     else:
         raw_chunks = _sliding_window(rel_path, content, "unknown")
 
-    # Attach content_hash for incremental-index dedup
     for chunk in raw_chunks:
         chunk["content_hash"] = md5_hash(chunk["chunk_text"])
+        chunk["file_path"] = rel_path
 
-    return raw_chunks
+    assign_chunk_ids(repo_id, rel_path, raw_chunks)
+
+    language = raw_chunks[0].get("language", "") if raw_chunks else ""
+    return ParsedFile(rel_path, language, md5_hash(content), raw_chunks)
 
 
 class Indexer:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
         self.db = get_db()
-        self.observer: Observer | None = None
+        self.repo_id = self.db.ensure_repository(repo_path)
+        self.observer: Optional[Observer] = None
         self.ollama_client = AsyncClient(host=Settings.OLLAMA_HOST)
 
     def walk_repo(self) -> Generator[str, None, None]:
@@ -81,73 +102,63 @@ class Indexer:
                     yield os.path.join(root, file)
 
     async def _embed_text(self, text: str) -> List[float]:
-        """Embed one text string. Returns zero vector on failure."""
+        """Embed one text string. Returns a zero vector on failure."""
         try:
             resp = await self.ollama_client.embeddings(
                 model=Settings.EMBED_MODEL,
                 prompt=f"search_document: {text}"
             )
-            # ollama SDK 0.5+: resp is an EmbeddingsResponse object
             return list(resp.embedding) if hasattr(resp, "embedding") else resp["embedding"]
         except Exception as e:
             logger.error(f"Ollama embed error: {e}")
             return [0.0] * 768
 
-    async def embed_and_store(self, chunks: List[Dict[str, Any]]):
-        if not chunks:
-            return
+    async def index_file(self, parsed: ParsedFile) -> Dict[str, int]:
+        """
+        Store one parsed file's chunks under this repository.
 
-        # Skip already-indexed chunks (content-hash dedup)
-        existing = set(self.db.get_existing_hashes([c["content_hash"] for c in chunks]))
-        new_chunks = [c for c in chunks if c["content_hash"] not in existing]
-        if not new_chunks:
-            return
+        Returns counts of {stored, skipped, failed}.
+        """
+        file_id = self.db.upsert_file(
+            self.repo_id, parsed.rel_path, parsed.content_hash, parsed.language
+        )
 
-        batch_size = 20
-        for i in range(0, len(new_chunks), batch_size):
-            batch = new_chunks[i : i + batch_size]
-            embeddings = [await self._embed_text(c["chunk_text"]) for c in batch]
-            self.db.batch_upsert(batch, embeddings)
+        # Replace this file's chunks wholesale. Task 9 turns this into a real
+        # per-chunk diff; the identity work it needs is already in place here.
+        existing = self.db.get_chunks_for_file(file_id)
+        if existing:
+            self.db.delete_chunks(list(existing.keys()))
 
-    def run_full_index(self):
-        files = list(self.walk_repo())
-        all_chunks: List[Dict[str, Any]] = []
+        if not parsed.chunks:
+            return {"stored": 0, "skipped": 0, "failed": 0}
 
-        with Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-        ) as progress:
-            parse_task = progress.add_task("Parsing files", total=len(files))
-            for fp in files:
-                chunks = chunk_file(fp, self.repo_path)
-                all_chunks.extend(chunks)
-                progress.update(parse_task, description=f"[cyan]{os.path.basename(fp)}")
-                progress.advance(parse_task)
+        embeddings = []
+        for chunk in parsed.chunks:
+            embeddings.append(await self._embed_text(chunk["chunk_text"]))
 
-            embed_task = progress.add_task("Embedding chunks", total=len(all_chunks))
+        self.db.upsert_chunks(self.repo_id, file_id, parsed.chunks, embeddings)
+        return {"stored": len(parsed.chunks), "skipped": 0, "failed": 0}
 
-            async def _run():
-                batch_size = 20
-                for i in range(0, len(all_chunks), batch_size):
-                    batch = all_chunks[i : i + batch_size]
-                    await self.embed_and_store(batch)
-                    progress.advance(embed_task, advance=len(batch))
+    async def embed_and_store(self, parsed: ParsedFile) -> Dict[str, int]:
+        """Backwards-compatible name used by the API worker."""
+        return await self.index_file(parsed)
 
-            asyncio.run(_run())
+    async def reindex_file_async(self, file_path: str) -> Dict[str, int]:
+        parsed = chunk_file(file_path, self.repo_path, self.repo_id)
+        result = await self.index_file(parsed)
+        logger.info(
+            "Re-indexed <%s> (%d chunks) in repo %s",
+            parsed.rel_path, len(parsed.chunks), self.repo_id[:8],
+        )
+        return result
 
-        logger.info(f"Indexed {len(files)} files → {len(all_chunks)} chunks total.")
+    def reindex_file(self, file_path: str) -> Dict[str, int]:
+        return asyncio.run(self.reindex_file_async(file_path))
 
-    async def reindex_file_async(self, file_path: str):
-        rel_path = os.path.relpath(file_path, self.repo_path)
-        self.db.delete_by_filepath(rel_path)
-        chunks = chunk_file(file_path, self.repo_path)
-        await self.embed_and_store(chunks)
-        logger.info(f"Re-indexed <{rel_path}> ({len(chunks)} chunks).")
-
-    def reindex_file(self, file_path: str):
-        asyncio.run(self.reindex_file_async(file_path))
+    def remove_file(self, file_path: str) -> None:
+        rel = normalize_rel_path(os.path.relpath(file_path, self.repo_path))
+        self.db.delete_file(self.repo_id, rel)
+        logger.info("Removed <%s> from repo %s", rel, self.repo_id[:8])
 
     def start_watchdog(self):
         if self.observer is not None:
@@ -158,20 +169,30 @@ class Indexer:
         self.observer.start()
         logger.info(f"Watchdog watching: {self.repo_path}")
 
+    def stop_watchdog(self):
+        if self.observer is None:
+            return
+        self.observer.stop()
+        self.observer.join(timeout=5)
+        self.observer = None
+
 
 class RepoEventHandler(FileSystemEventHandler):
     def __init__(self, indexer: Indexer):
         self.indexer = indexer
 
+    def _is_indexable(self, src_path: str) -> bool:
+        ext = os.path.splitext(src_path)[1].lower()
+        if ext not in LANGUAGES:
+            return False
+        parts = src_path.split(os.sep)
+        return not any(ign in parts for ign in IGNORE_DIRS)
+
     def on_modified(self, event):
-        if event.is_directory:
+        if event.is_directory or not self._is_indexable(event.src_path):
             return
-        ext = os.path.splitext(event.src_path)[1].lower()
-        if ext in LANGUAGES:
-            parts = event.src_path.split(os.sep)
-            if not any(ign in parts for ign in IGNORE_DIRS):
-                logger.info(f"File changed: {event.src_path} — re-indexing")
-                self.reindex_safe(event.src_path)
+        logger.info(f"File changed: {event.src_path} - re-indexing")
+        self.reindex_safe(event.src_path)
 
     def reindex_safe(self, path: str):
         try:

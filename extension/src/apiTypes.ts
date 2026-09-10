@@ -26,11 +26,20 @@ export interface QueryRequest {
     /** 1..20 inclusive; the backend rejects anything outside that range. */
     top_k: number;
     explain: boolean;
+    /**
+     * Repository to search. Results are always scoped to exactly one
+     * repository; omitting this searches the most recently indexed one.
+     */
+    repo_path?: string;
 }
 
 /** One search hit. */
 export interface QueryResult {
     symbol_name: string;
+    /** Dotted path, e.g. "module.Class.method". */
+    qualified_name: string;
+    /** function | method | class | interface | module | ... */
+    symbol_type: string;
     file_path: string;
     start_line: number;
     end_line: number;
@@ -52,6 +61,8 @@ export interface QueryResponse {
 export interface StatusResponse {
     indexed_chunks: number;
     last_indexed: string | null;
+    /** Root of the repository these numbers describe. */
+    repo_path: string | null;
     db_path: string;
     embed_model: string;
     watching: boolean;
