@@ -18,6 +18,8 @@ tsconfig.json
 .venv/**
 venv/**
 tests/**
+extension/test/**
+jest.config.js
 pytest.ini
 pyproject.toml
 .vectorai_db/**

@@ -1,6 +1,6 @@
 {
   "name": "codelens",
-  "displayName": "CodeLens — Offline Semantic Search",
+  "displayName": "CodeLens \u2014 Offline Semantic Search",
   "description": "Natural-language semantic search for your codebase. Fully offline: tree-sitter chunking, local Ollama embeddings, local SQLite vector store.",
   "version": "0.2.0",
   "publisher": "nikhilmourya",
@@ -109,17 +109,22 @@
     }
   },
   "scripts": {
-    "build":            "tsc -p ./",
-    "watch":            "tsc -watch -p ./",
-    "compile":          "tsc -p ./",
+    "build": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "compile": "tsc -p ./",
     "vscode:prepublish": "npm run compile",
-    "package":          "vsce package"
+    "package": "vsce package",
+    "test": "jest",
+    "test:watch": "jest --watch"
   },
   "devDependencies": {
-    "@types/vscode": "^1.86.0",
+    "@types/jest": "^29.5.14",
     "@types/node": "18.x",
-    "typescript": "^5.3.3",
-    "@vscode/vsce": "^3.0.0"
+    "@types/vscode": "^1.86.0",
+    "@vscode/vsce": "^3.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.12",
+    "typescript": "^5.3.3"
   },
   "dependencies": {
     "axios": "^1.6.8"
