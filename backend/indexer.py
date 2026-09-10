@@ -25,6 +25,7 @@ from backend.db_client import (
 )
 from backend.config import Settings
 from backend.tree_sitter_parser import LANGUAGES, extract_chunks, _sliding_window
+from backend.vector_store import VectorStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -93,7 +94,9 @@ def chunk_file(file_path: str, repo_root: str, repo_id: str) -> ParsedFile:
 class Indexer:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
-        self.db = get_db()
+        # Typed as the interface, not the SQLite class: nothing in the indexer
+        # may depend on how storage is implemented.
+        self.db: VectorStore = get_db()
         self.repo_id = self.db.ensure_repository(repo_path)
         self.observer: Optional[Observer] = None
         self.worker: Optional["_IndexWorker"] = None
