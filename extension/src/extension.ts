@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
-import { spawn, ChildProcess, execSync } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import axios from 'axios';
 import { SearchPanelProvider } from './searchPanel';
+import { ensureBackendEnv, BackendSetupError } from './pythonEnv';
 
 let backendProcess: ChildProcess | undefined;
 let statusBarItem: vscode.StatusBarItem;
@@ -9,27 +10,6 @@ let pollInterval: NodeJS.Timeout;
 
 const PORT = 8000;
 const API_URL = `http://127.0.0.1:${PORT}`;
-
-/** Find best available Python 3 (prefers 3.11, falls back to 3.12, then python3) */
-function detectPython(): string {
-    const candidates = [
-        '/usr/local/bin/python3.11',
-        '/usr/local/bin/python3.12',
-        '/usr/local/bin/python3',
-        '/usr/bin/python3',
-        'python3',
-    ];
-    for (const p of candidates) {
-        try {
-            execSync(`${p} --version`, { stdio: 'ignore' });
-            return p;
-        } catch { /* try next */ }
-    }
-    return 'python3';
-}
-
-const PYTHON = detectPython();
-const OLLAMA_BIN = '/Applications/Ollama.app/Contents/Resources/ollama';
 
 export async function activate(context: vscode.ExtensionContext) {
     // 1. Boot Python Backend Context
@@ -83,20 +63,32 @@ export async function activate(context: vscode.ExtensionContext) {
     }, 4500); // giving uvicorn maximum startup leeway
 }
 
-function startBackendServer(context: vscode.ExtensionContext) {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
-    // The backend lives in the 'codelens' sub-folder of the workspace
-    const cwd = workspaceRoot ? `${workspaceRoot}/codelens` : __dirname;
+/**
+ * Start the backend that ships inside this extension.
+ *
+ * The backend is resolved from the extension's own install directory, never
+ * from the user's workspace: the `backend` package is bundled in the .vsix and
+ * its dependencies live in an extension-owned virtual environment provisioned
+ * on first activation.
+ */
+async function startBackendServer(context: vscode.ExtensionContext) {
+    let env;
+    try {
+        env = await ensureBackendEnv(context);
+    } catch (err) {
+        reportSetupFailure(err);
+        return;
+    }
 
     backendProcess = spawn(
-        PYTHON,
+        env.pythonPath,
         ['-m', 'uvicorn', 'backend.main:app', '--host', '127.0.0.1', '--port', PORT.toString()],
         {
-            cwd,
+            // cwd is the extension root so that `backend.main` imports as a package.
+            cwd: env.extensionRoot,
             detached: false,
             env: {
                 ...process.env,
-                PATH: `/Applications/Ollama.app/Contents/Resources:${process.env.PATH}`,
                 OLLAMA_HOST: 'http://localhost:11434',
             }
         }
@@ -104,10 +96,32 @@ function startBackendServer(context: vscode.ExtensionContext) {
 
     backendProcess.stdout?.on('data', (d) => console.log(`[CodeLens]: ${d}`));
     backendProcess.stderr?.on('data', (d) => console.error(`[CodeLens ERR]: ${d}`));
+    backendProcess.on('error', (err) => {
+        console.error(`[CodeLens] Backend failed to spawn: ${err.message}`);
+        statusBarItem.text = '$(error) CodeLens: failed to start';
+        vscode.window.showErrorMessage(
+            `CodeLens could not start its backend process (${env.pythonPath}): ${err.message}`,
+        );
+    });
     backendProcess.on('exit', (code) => {
         console.warn(`[CodeLens] Backend exited with code ${code}`);
         statusBarItem.text = '$(database) CodeLens: Offline';
     });
+}
+
+/** Surface a BackendSetupError as a message that names the fix. */
+function reportSetupFailure(err: unknown) {
+    if (statusBarItem) {
+        statusBarItem.text = '$(error) CodeLens: setup failed';
+    }
+    if (err instanceof BackendSetupError) {
+        console.error(`[CodeLens] ${err.message}`);
+        vscode.window.showErrorMessage(`${err.message} ${err.remedy}`);
+    } else {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[CodeLens] Backend setup failed: ${message}`);
+        vscode.window.showErrorMessage(`CodeLens backend setup failed: ${message}`);
+    }
 }
 
 function startPolling() {

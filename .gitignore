@@ -13,3 +13,7 @@ last_repo.json
 *.vsix
 node_modules/
 dist/
+
+# Packaging / local env
+.venv/
+requirements.lock
