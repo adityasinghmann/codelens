@@ -5,6 +5,7 @@ import axios from 'axios';
 import * as http from 'http';
 import { apiUrl } from './config';
 import { SseParser, parseJsonEvent, SseEvent } from './sseParser';
+import { IndexEvent, QueryResponse, IndexRequest, QueryRequest } from './apiTypes';
 
 export class SearchPanelProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -47,11 +48,8 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
     private async handleQuery(text: string, explain: boolean) {
         try {
             // Native Axios bindings directly parsing localhost backend
-            const res = await axios.post(`${apiUrl()}/query`, {
-                query: text,
-                top_k: 8,
-                explain: explain
-            });
+            const body: QueryRequest = { query: text, top_k: 8, explain };
+            const res = await axios.post<QueryResponse>(`${apiUrl()}/query`, body);
             this._view?.webview.postMessage({
                 type: 'results',
                 data: res.data.results,
@@ -71,7 +69,8 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
             return;
         }
 
-        const payload = JSON.stringify({ repo_path: workspaceDir, force_reindex: true });
+        const body: IndexRequest = { repo_path: workspaceDir, force_reindex: true };
+        const payload = JSON.stringify(body);
         const parser = new SseParser();
         // Tracks whether the backend told us it finished. If the socket closes
         // without a 'complete' event, the index was truncated and the user must
@@ -143,7 +142,7 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
      * Returns true if this was the terminal 'complete' event.
      */
     private dispatchIndexEvent(event: SseEvent): boolean {
-        const parsed = parseJsonEvent<any>(event);
+        const parsed = parseJsonEvent<IndexEvent>(event);
         if (!parsed.ok) {
             // Log rather than swallow: a malformed payload is a backend bug and
             // silently dropping it is what hid the old parser's data loss.
@@ -182,9 +181,15 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
                     ? `${message.file}: ${message.message}`
                     : message.message);
                 return false;
-            default:
-                console.warn(`[CodeLens] Ignoring unknown index event type: ${JSON.stringify(message.type)}`);
+            default: {
+                // Unreachable for the contract in apiTypes.ts - TypeScript
+                // narrows `message` to never here, which is the exhaustiveness
+                // check. Kept as a runtime guard against a backend newer than
+                // the extension emitting an event type we do not know yet.
+                const unknown = message as { type?: unknown };
+                console.warn(`[CodeLens] Ignoring unknown index event type: ${JSON.stringify(unknown.type)}`);
                 return false;
+            }
         }
     }
 

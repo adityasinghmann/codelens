@@ -101,14 +101,66 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"error": type(exc).__name__, "detail": str(exc)}
     )
 
+# ---------------------------------------------------------------------------
+# API contract - the single source of truth.
+#
+# These models are what FastAPI validates against at runtime, so they cannot
+# drift from the server's actual behaviour. extension/src/apiTypes.ts mirrors
+# them for the TypeScript side and points back here; keep the two in step when
+# changing anything below.
+#
+# The former shared/types.py and shared/types.ts declared a different, unused
+# contract (workspace_path, include_patterns, exclude_patterns, IndexStatus)
+# that no code on either side imported. They have been deleted.
+# ---------------------------------------------------------------------------
+
 class IndexRequest(BaseModel):
+    """Body of POST /index."""
     repo_path: str
     force_reindex: bool = False
 
+
 class QueryRequest(BaseModel):
+    """Body of POST /query."""
     query: str
     top_k: int = Field(8, ge=1, le=20)
     explain: bool = False
+
+
+class QueryResult(BaseModel):
+    """One search hit."""
+    symbol_name: str
+    file_path: str
+    start_line: int
+    end_line: int
+    language: str
+    chunk_text: str
+    # Cosine similarity in [0, 1]. A similarity, not a probability.
+    score: float
+
+
+class QueryResponse(BaseModel):
+    """Body of the POST /query response."""
+    results: list[QueryResult]
+    explain_text: str | None = None
+    query_ms: int
+    total_indexed: int
+
+
+class StatusResponse(BaseModel):
+    """Body of the GET /status response."""
+    indexed_chunks: int
+    last_indexed: str | None
+    db_path: str
+    embed_model: str
+    watching: bool
+
+
+class HealthResponse(BaseModel):
+    """Body of the GET /health response."""
+    ollama: bool
+    vectorai: bool
+    ollama_error: str | None = None
 
 def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asyncio.AbstractEventLoop):
     def send(event: dict | None):
@@ -194,7 +246,7 @@ async def api_index(req: IndexRequest):
             
     return StreamingResponse(sse_gen(), media_type="text/event-stream")
 
-@app.post("/query")
+@app.post("/query", response_model=QueryResponse)
 async def api_query(req: QueryRequest):
     if not req.query.strip():
          raise HTTPException(status_code=400, detail="Query payload empty.")
@@ -216,7 +268,7 @@ async def api_query(req: QueryRequest):
         "total_indexed": total_indexed
     }
 
-@app.get("/status")
+@app.get("/status", response_model=StatusResponse)
 async def api_status():
     db = get_db()
     
@@ -239,7 +291,7 @@ async def api_status():
         "watching": global_indexer is not None and global_indexer.observer is not None
     }
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def api_health():
     import urllib.request
     ollama_ok = False

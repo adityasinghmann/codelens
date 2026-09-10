@@ -45,8 +45,8 @@ class LocalVectorDB:
                     symbol_name  TEXT,
                     chunk_text   TEXT,
                     file_path    TEXT,
-                    line_start   INTEGER,
-                    line_end     INTEGER,
+                    start_line   INTEGER,
+                    end_line     INTEGER,
                     language     TEXT,
                     content_hash TEXT UNIQUE,
                     embedding    BLOB NOT NULL
@@ -70,8 +70,8 @@ class LocalVectorDB:
                 meta.get("symbol_name", ""),
                 meta.get("chunk_text", ""),
                 meta.get("file_path", ""),
-                meta.get("line_start", 0),
-                meta.get("line_end", 0),
+                meta.get("start_line", 0),
+                meta.get("end_line", 0),
                 meta.get("language", ""),
                 meta.get("content_hash", str(uuid.uuid4())),
                 emb_blob,
@@ -80,7 +80,7 @@ class LocalVectorDB:
             conn.executemany("""
                 INSERT OR REPLACE INTO chunks
                     (id, symbol_name, chunk_text, file_path,
-                     line_start, line_end, language, content_hash, embedding)
+                     start_line, end_line, language, content_hash, embedding)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
             conn.commit()
@@ -122,7 +122,7 @@ class LocalVectorDB:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT symbol_name, chunk_text, file_path, "
-                "line_start, line_end, language, embedding FROM chunks"
+                "start_line, end_line, language, embedding FROM chunks"
             ).fetchall()
 
         if not rows:
@@ -144,8 +144,8 @@ class LocalVectorDB:
                 "symbol_name": rows[i][0],
                 "chunk_text":  rows[i][1],
                 "file_path":   rows[i][2],
-                "line_start":  rows[i][3],
-                "line_end":    rows[i][4],
+                "start_line":  rows[i][3],
+                "end_line":    rows[i][4],
                 "language":    rows[i][5],
                 "score":       float(scores[i]),
             }
