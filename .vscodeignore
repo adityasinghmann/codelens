@@ -1,11 +1,33 @@
+# Files excluded from the packaged .vsix.
+#
+# NOTE: backend/** is deliberately NOT excluded. The Python backend ships
+# inside the extension and is launched from the extension install directory.
+
 .vscode/**
 .vscode-test/**
-backend/**
-node_modules/**
-tsconfig.json
-pyproject.toml
-setup.sh
-docker-compose.yml
-.env.example
+.github/**
+
+# TypeScript sources - only the compiled dist/ output is shipped.
 **/*.ts
-!dist/*.js
+**/*.map
+tsconfig.json
+
+# Python build/dev artefacts that must never reach the .vsix.
+**/__pycache__/**
+**/*.pyc
+.venv/**
+venv/**
+tests/**
+pytest.ini
+pyproject.toml
+.vectorai_db/**
+.codelens_index/**
+
+# Developer tooling and local config.
+node_modules/.bin/**
+setup.sh
+start.sh
+docker-compose.yml
+.env
+.env.example
+.gitignore

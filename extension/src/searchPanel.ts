@@ -140,7 +140,17 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
     }
 
     private getHtmlForWebview() {
-        const htmlPath = vscode.Uri.joinPath(this._extensionUri, 'media', 'panel.html');
-        return fs.readFileSync(htmlPath.fsPath, 'utf-8');
+        // The webview markup lives at <extensionRoot>/extension/media/panel.html
+        // (media/ at the root holds only the activity-bar icon).
+        const htmlPath = vscode.Uri.joinPath(this._extensionUri, 'extension', 'media', 'panel.html');
+        try {
+            return fs.readFileSync(htmlPath.fsPath, 'utf-8');
+        } catch (err: any) {
+            const message = `CodeLens could not load its sidebar UI from ${htmlPath.fsPath}: ${err.message}`;
+            vscode.window.showErrorMessage(`${message} Reinstall the CodeLens extension.`);
+            return `<!DOCTYPE html><html><body style="font-family: var(--vscode-font-family); padding: 16px;">
+                <p>CodeLens failed to load its interface.</p>
+                <p style="opacity:.7">${message}</p></body></html>`;
+        }
     }
 }

@@ -75,7 +75,7 @@
     "watch":            "tsc -watch -p ./",
     "compile":          "tsc -p ./",
     "vscode:prepublish": "npm run compile",
-    "package":          "vsce package --no-dependencies"
+    "package":          "vsce package"
   },
   "devDependencies": {
     "@types/vscode": "^1.86.0",
