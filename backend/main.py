@@ -19,7 +19,7 @@ load_dotenv()
 from backend.config import Settings
 from backend.db_client import get_db, repo_id_for
 from backend.indexer import Indexer, chunk_file
-from backend.query import run_query
+from backend.query import run_query, EmbeddingModelMismatch
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +328,12 @@ async def api_query(req: QueryRequest):
     start_time = time.time()
     db = get_db()
 
-    data = await run_query(req.query, repo_id=repo_id, top_k=req.top_k, explain=req.explain)
+    try:
+        data = await run_query(req.query, repo_id=repo_id, top_k=req.top_k, explain=req.explain)
+    except EmbeddingModelMismatch as e:
+        # 409: the index is in a state incompatible with the request, and the
+        # user has a concrete action (re-index). Not a 500.
+        raise HTTPException(status_code=409, detail=str(e))
 
     query_ts = int((time.time() - start_time) * 1000)
     # Scoped to the repository actually searched, not the whole database.

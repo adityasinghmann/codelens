@@ -35,6 +35,10 @@ IGNORE_DIRS = {"node_modules", ".git", "vendor", "dist", "__pycache__", "build",
 SUPPORTED_EXTENSIONS = set(LANGUAGES.keys()) | {".md", ".txt", ".toml", ".yaml", ".yml"}
 
 
+class EmbeddingDimensionMismatch(RuntimeError):
+    """Raised when a vector's width disagrees with what the index recorded."""
+
+
 def md5_hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
@@ -103,17 +107,61 @@ class Indexer:
                 if ext in SUPPORTED_EXTENSIONS:
                     yield os.path.join(root, file)
 
-    async def _embed_text(self, text: str) -> List[float]:
-        """Embed one text string. Returns a zero vector on failure."""
+    async def _embed_text(self, text: str) -> Optional[List[float]]:
+        """
+        Embed one text string, or return None if the embedding could not be
+        produced.
+
+        None, not a zero vector. The previous implementation returned
+        [0.0] * 768 on failure and that vector was persisted as a real chunk:
+        it never matched anything, was never retried because its content_hash
+        looked current, and silently corrupted the index. The 768 was also
+        hardcoded regardless of the model's actual width.
+        """
         try:
             resp = await self.ollama_client.embeddings(
                 model=Settings.EMBED_MODEL,
                 prompt=f"search_document: {text}"
             )
-            return list(resp.embedding) if hasattr(resp, "embedding") else resp["embedding"]
+            vector = list(resp.embedding) if hasattr(resp, "embedding") else resp["embedding"]
         except Exception as e:
             logger.error(f"Ollama embed error: {e}")
-            return [0.0] * 768
+            return None
+
+        if not vector:
+            logger.error("Ollama returned an empty embedding for a chunk; dropping it.")
+            return None
+        return vector
+
+    def _check_dimension(self, vector: List[float]) -> int:
+        """
+        Reconcile an embedding's width against what this repository recorded.
+
+        The dimension is derived from the first successful embedding rather
+        than assumed. A later vector of a different width means the model
+        changed underneath the index, which would silently produce garbage
+        scores, so it raises instead.
+        """
+        width = len(vector)
+        meta = self.db.get_index_metadata(self.repo_id) or {}
+        recorded = meta.get("embedding_dimension") or 0
+
+        if not recorded:
+            self.db.set_index_metadata(
+                self.repo_id,
+                embedding_model=Settings.EMBED_MODEL,
+                embedding_dimension=width,
+            )
+            return width
+
+        if recorded != width:
+            raise EmbeddingDimensionMismatch(
+                f"Embedding model returned {width}-dimensional vectors but this "
+                f"index was built with {recorded} dimensions "
+                f"(model {meta.get('embedding_model')!r}, now {Settings.EMBED_MODEL!r}). "
+                f"Re-index this repository to rebuild it."
+            )
+        return width
 
     async def index_file(self, parsed: ParsedFile) -> Dict[str, int]:
         """
@@ -169,11 +217,29 @@ class Indexer:
 
         stored = failed = 0
         if to_embed:
-            embeddings = []
+            keep_chunks: List[Dict[str, Any]] = []
+            keep_vectors: List[List[float]] = []
+
             for chunk in to_embed:
-                embeddings.append(await self._embed_text(chunk["chunk_text"]))
-            self.db.upsert_chunks(self.repo_id, file_id, to_embed, embeddings)
-            stored = len(to_embed)
+                vector = await self._embed_text(chunk["chunk_text"])
+                if vector is None:
+                    # Dropped, never written. It will be retried on the next
+                    # index because no row exists to make it look current.
+                    failed += 1
+                    continue
+                self._check_dimension(vector)
+                keep_chunks.append(chunk)
+                keep_vectors.append(vector)
+
+            if keep_chunks:
+                self.db.upsert_chunks(self.repo_id, file_id, keep_chunks, keep_vectors)
+            stored = len(keep_chunks)
+
+            if failed:
+                logger.warning(
+                    "%d chunk(s) in %s could not be embedded and were not stored",
+                    failed, parsed.rel_path,
+                )
 
         return {"stored": stored, "skipped": skipped, "deleted": len(removed), "failed": failed}
 
