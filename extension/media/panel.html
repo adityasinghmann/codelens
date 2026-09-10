@@ -563,7 +563,7 @@
                         li.innerHTML = `
                             <div class="card-header">
                                 <span class="filename">${r.file_path}</span>
-                                <span class="line-range">line ${r.line_start}–${r.line_end}</span>
+                                <span class="line-range">line ${r.start_line}–${r.end_line}</span>
                             </div>
                             <div class="symbol-row">
                                 <span class="symbol-name" title="${r.symbol_name}">${r.symbol_name}</span>
@@ -575,13 +575,13 @@
                             <div class="divider"></div>
                             <pre class="code-block">${syntaxParser.highlight(r.chunk_text)}</pre>
                             <div class="card-actions">
-                                <button class="ghost-btn jump-btn" data-file="${r.file_path}" data-line="${r.line_start}">Jump to file →</button>
+                                <button class="ghost-btn jump-btn" data-file="${r.file_path}" data-line="${r.start_line}">Jump to file →</button>
                                 <button class="ghost-btn cp-btn">Copy</button>
                             </div>
                         `;
                         
                         li.querySelector('.jump-btn').addEventListener('click', () => {
-                            vscode.postMessage({ type: 'jumpTo', file: r.file_path, line: r.line_start });
+                            vscode.postMessage({ type: 'jumpTo', file: r.file_path, line: r.start_line });
                         });
                         
                         uiTokens.resultsCont.appendChild(li);

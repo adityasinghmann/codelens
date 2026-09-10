@@ -121,8 +121,8 @@ def extract_chunks(file_path: str, content: str) -> list[dict]:
 
             chunks.append({
                 "file_path":   file_path,
-                "line_start":  start_row + 1,
-                "line_end":    end_row   + 1,
+                "start_line":  start_row + 1,
+                "end_line":    end_row   + 1,
                 "symbol_name": symbol_name,
                 "language":    lang_name,
                 "chunk_text":  chunk_text,
@@ -152,8 +152,8 @@ def _sliding_window(file_path: str, content: str, lang_name: str,
             continue
         chunks.append({
             "file_path":   file_path,
-            "line_start":  i + 1,
-            "line_end":    i + len(chunk_lines),
+            "start_line":  i + 1,
+            "end_line":    i + len(chunk_lines),
             "symbol_name": f"lines_{i+1}_{i+len(chunk_lines)}",
             "language":    lang_name,
             "chunk_text":  text,

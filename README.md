@@ -206,62 +206,77 @@ uvicorn backend.main:app --host 127.0.0.1 --port 8000
 
 ---
 
-## 🔌 API Reference
+## 🔌 API Contract
 
-### `POST /index` — Index a repository
-```bash
-curl -X POST http://localhost:8000/index \
-  -H "Content-Type: application/json" \
-  -d '{"repo_path": "/path/to/your/repo", "force_reindex": false}'
-```
-Returns a **Server-Sent Events stream** with real-time progress:
+The contract is defined once, as the Pydantic models in `backend/main.py`.
+Those models are what FastAPI validates against at runtime, so they cannot
+drift from the server's behaviour. `extension/src/apiTypes.ts` is a
+hand-maintained TypeScript mirror of the same shapes and points back at them.
+
+### `POST /index` - index a repository
+
+Request: `{"repo_path": "/abs/path/to/repo", "force_reindex": false}`
+
+Responds with a `text/event-stream`. Each event is `data: <json>
+
+`:
+
 ```json
-{"type": "progress", "file": "src/auth.py", "chunks": 12, "total_files": 847}
-{"type": "complete", "total_chunks": 9432, "duration_ms": 41200}
+{"type": "progress", "file": "src/auth.py", "processed_files": 12, "total_files": 240, "processed_chunks": 318}
+{"type": "error",    "file": "src/broken.py", "message": "..."}
+{"type": "complete", "total_files": 240, "processed_files": 240, "total_chunks": 6104, "duration_ms": 41200}
 ```
 
-### `POST /query` — Semantic search
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "where does JWT validation happen?", "top_k": 8, "explain": false}'
-```
+`processed_files` and `total_files` are in the same unit, so
+`processed_files / total_files` is the real progress fraction. A file that
+fails to parse still advances `processed_files`, so the stream always reaches
+100%. `file` is repository-relative.
+
+Returns 400 if `repo_path` does not exist or is not a directory.
+
+### `POST /query` - semantic search
+
+Request: `{"query": "where is JWT validated?", "top_k": 8, "explain": false}`
+(`top_k` must be 1..20; a blank query returns 400.)
+
 ```json
 {
   "results": [
     {
       "symbol_name": "validate_jwt_token",
       "file_path": "auth/middleware.py",
-      "line_start": 34,
-      "line_end": 67,
+      "start_line": 34,
+      "end_line": 67,
       "language": "python",
-      "score": 0.94,
-      "chunk_text": "def validate_jwt_token(token: str) -> User:..."
+      "chunk_text": "def validate_jwt_token(token: str) -> User: ...",
+      "score": 0.71
     }
   ],
+  "explain_text": null,
   "query_ms": 38,
-  "total_indexed": 9432
+  "total_indexed": 6104
 }
 ```
 
-### `GET /status` — Engine status
+`score` is cosine similarity clamped to [0, 1]. It is a similarity, not a
+probability and not a confidence.
+
+### `GET /status`
+
 ```json
-{
-  "indexed_chunks": 9432,
-  "last_indexed": "2026-04-16T14:20:16Z",
-  "embed_model": "nomic-embed-text",
-  "watching": true
-}
+{"indexed_chunks": 6104, "last_indexed": "2026-04-16T14:20:16", "db_path": "./.vectorai_db",
+ "embed_model": "nomic-embed-text", "watching": true}
 ```
 
-### `GET /health` — Dependency health check
+### `GET /health`
+
 ```json
-{
-  "ollama": true,
-  "vectorai": true,
-  "ollama_error": null
-}
+{"ollama": true, "vectorai": true, "ollama_error": null}
 ```
+
+> The former `shared/types.py` and `shared/types.ts` declared a different
+> contract (`workspace_path`, `include_patterns`, `exclude_patterns`,
+> `IndexStatus`) that neither side ever imported. They have been deleted.
 
 ---
 
@@ -334,12 +349,17 @@ CodeLens/
 │
 ├── extension/                  # VS Code extension (TypeScript)
 │   ├── src/
-│   │   ├── extension.ts        # Extension entry, backend process spawner
+│   │   ├── extension.ts        # Extension entry, command + status bar wiring
+│   │   ├── backendProcess.ts   # Backend lifecycle: spawn, readiness, shutdown
+│   │   ├── pythonEnv.ts        # Interpreter discovery + venv provisioning
+│   │   ├── toolResolver.ts     # Cross-platform Python/Ollama resolution
+│   │   ├── sseParser.ts        # Incremental Server-Sent Events parser
+│   │   ├── apiTypes.ts         # TypeScript mirror of the backend contract
+│   │   ├── config.ts           # Settings + API base URL (single source)
 │   │   └── searchPanel.ts      # Webview provider, message handler
 │   └── media/
 │       └── panel.html          # Full sidebar UI (search, results, progress)
 │
-├── shared/                     # Shared type definitions
 ├── setup.sh                    # ⭐ One-command full setup script
 ├── docker-compose.yml          # Docker deployment option
 ├── pyproject.toml              # Python dependency manifest

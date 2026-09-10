@@ -15,7 +15,6 @@ services:
       - TOP_K=10
     volumes:
       - ./backend:/app/backend
-      - ./shared:/app/shared
       - vectorai_data:/app/.vectorai_db
     depends_on:
       - ollama
