@@ -64,10 +64,9 @@ async def lifespan(app: FastAPI):
 
     yield
     
-    # Teardown logic
-    if global_indexer and global_indexer.observer:
-        global_indexer.observer.stop()
-        global_indexer.observer.join()
+    # Teardown: stop the watcher and its background index loop.
+    if global_indexer is not None:
+        global_indexer.stop_watchdog()
 
 app = FastAPI(title="CodeLens Offline Core", lifespan=lifespan)
 
