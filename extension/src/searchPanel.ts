@@ -203,16 +203,39 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
     private async handleJumpTo(file: string, line: number) {
         const workspace = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
         if (!workspace) return;
-        
-        const absolutePath = path.join(workspace, file);
+
+        // Containment check. `file` comes from a search result, which comes
+        // from the index, which is built from files on disk - but it is still
+        // untrusted input by the time it round-trips through the webview, and
+        // path.join happily resolves "../../../etc/passwd". Resolve first,
+        // then confirm the result is genuinely inside the workspace.
+        const root = path.resolve(workspace);
+        const absolutePath = path.resolve(root, file);
+        const relative = path.relative(root, absolutePath);
+
+        const escapes =
+            relative === '' ||
+            relative.startsWith('..') ||
+            path.isAbsolute(relative);
+
+        if (escapes) {
+            console.error(
+                `[CodeLens] Refusing to open a path outside the workspace: ${file} -> ${absolutePath}`
+            );
+            vscode.window.showErrorMessage(
+                `CodeLens refused to open "${file}" because it resolves outside the workspace.`
+            );
+            return;
+        }
+
         try {
             const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(absolutePath));
             const editor = await vscode.window.showTextDocument(doc);
-            
-            // Adjust to VS Code internal 0-indexed engine structure safely mapping bounds
+
+            // Adjust to VS Code's 0-indexed positions.
             const vsLine = Math.max(0, line - 1);
             const range = new vscode.Range(vsLine, 0, vsLine, 0);
-            
+
             editor.selection = new vscode.Selection(range.start, range.end);
             editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
         } catch (e: any) {
