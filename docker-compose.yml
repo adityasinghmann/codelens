@@ -8,14 +8,14 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - VECTORAI_DB_PATH=/app/.vectorai_db
+      - CODELENS_INDEX_PATH=/app/.codelens_index
       - OLLAMA_HOST=http://ollama:11434
       - EMBED_MODEL=nomic-embed-text
       - CHUNK_SIZE=512
       - TOP_K=10
     volumes:
       - ./backend:/app/backend
-      - vectorai_data:/app/.vectorai_db
+      - index_data:/app/.codelens_index
     depends_on:
       - ollama
 
@@ -29,5 +29,5 @@ services:
       sh -c "ollama serve & sleep 3 && ollama pull nomic-embed-text && wait"
 
 volumes:
-  vectorai_data:
+  index_data:
   ollama_data:

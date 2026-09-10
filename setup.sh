@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================
 # CodeLens — One-Command Setup
-# Works on macOS (Intel + Apple Silicon) & Linux (ARM/x86)
+# POSIX shell script: macOS and Linux. On Windows, use the VS Code extension,
+# which provisions its own environment.
 # ============================================================
 set -e
 
@@ -22,7 +23,7 @@ echo "  ██║     ██║   ██║██║  ██║██╔══�
 echo "  ╚██████╗╚██████╔╝██████╔╝███████╗███████╗███████╗██║ ╚████║███████║"
 echo "   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚══════╝╚═╝  ╚═══╝╚══════╝"
 echo ""
-echo "  Offline Semantic Codebase Search • Powered by Actian VectorAI DB"
+echo "  Offline Semantic Codebase Search"
 echo ""
 
 # ────────────────────────────────────────────────────────────
@@ -126,11 +127,11 @@ echo "▶ Installing Python dependencies..."
 ok "Python dependencies installed"
 
 # ────────────────────────────────────────────────────────────
-# 5. VectorAI DB directory
+# 5. Local index directory
 # ────────────────────────────────────────────────────────────
-echo "▶ Initialising local VectorAI DB..."
-mkdir -p ./.vectorai_db
-ok "VectorAI DB directory ready at ./.vectorai_db"
+echo "▶ Initialising local index directory..."
+mkdir -p ./.codelens_index
+ok "Index directory ready at ./.codelens_index"
 
 # ────────────────────────────────────────────────────────────
 # 6. VS Code extension (optional — skip if npm missing)

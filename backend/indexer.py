@@ -1,6 +1,6 @@
 """
-Indexer — walks a repo, AST-chunks files, embeds with Ollama,
-and upserts into the VectorAI DB (SQLite+numpy adapter).
+Indexer - walks a repo, AST-chunks files, embeds with Ollama,
+and upserts into the local SQLite vector store.
 
 Changes vs original:
  • tree-sitter 0.22+ API (Language one-arg, Parser(language))
@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 IGNORE_DIRS = {"node_modules", ".git", "vendor", "dist", "__pycache__", "build",
-               ".venv", "venv", ".vectorai_db", "out"}
+               ".venv", "venv", ".vectorai_db", ".codelens_index", "out"}
 
 SUPPORTED_EXTENSIONS = set(LANGUAGES.keys()) | {".md", ".txt", ".toml", ".yaml", ".yml"}
 

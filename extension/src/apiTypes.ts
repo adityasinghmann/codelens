@@ -59,8 +59,10 @@ export interface StatusResponse {
 
 /** GET /health response body. */
 export interface HealthResponse {
+    /** Whether the Ollama server answered. */
     ollama: boolean;
-    vectorai: boolean;
+    /** Whether the local index directory is present and readable. */
+    index: boolean;
     ollama_error: string | null;
 }
 

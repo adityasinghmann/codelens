@@ -24,7 +24,7 @@ from backend.query import run_query
 logger = logging.getLogger(__name__)
 
 SIDECAR_FILE = os.path.join(
-    os.path.dirname(Settings.VECTORAI_DB_PATH) if os.path.dirname(Settings.VECTORAI_DB_PATH) else ".",
+    os.path.dirname(Settings.INDEX_PATH) if os.path.dirname(Settings.INDEX_PATH) else ".",
     "last_repo.json"
 )
 global_indexer: Indexer | None = None
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
     # UnicodeEncodeError from inside lifespan, which aborted application startup
     # entirely -- the backend never came up at all.
     logger.info("CodeLens backend starting")
-    logger.info("Index path: %s", Settings.VECTORAI_DB_PATH)
+    logger.info("Index path: %s", Settings.INDEX_PATH)
     logger.info("Total chunks in index: %d", db.count())
 
     import urllib.request
@@ -159,7 +159,7 @@ class StatusResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Body of the GET /health response."""
     ollama: bool
-    vectorai: bool
+    index: bool
     ollama_error: str | None = None
 
 def indexer_worker(repo_path: str, force: bool, q: asyncio.Queue, main_loop: asyncio.AbstractEventLoop):
@@ -286,7 +286,7 @@ async def api_status():
     return {
         "indexed_chunks": db.count(),
         "last_indexed": last_indexed,
-        "db_path": Settings.VECTORAI_DB_PATH,
+        "db_path": Settings.INDEX_PATH,
         "embed_model": Settings.EMBED_MODEL,
         "watching": global_indexer is not None and global_indexer.observer is not None
     }
@@ -304,13 +304,13 @@ async def api_health():
         ollama_err = str(e)
         
     db_ok = False
-    db_dir = os.path.dirname(Settings.VECTORAI_DB_PATH)
-    if os.path.exists(Settings.VECTORAI_DB_PATH) or (db_dir and os.path.exists(db_dir)):
+    db_dir = os.path.dirname(Settings.INDEX_PATH)
+    if os.path.exists(Settings.INDEX_PATH) or (db_dir and os.path.exists(db_dir)):
         db_ok = True
         
     return {
         "ollama": ollama_ok,
-        "vectorai": db_ok,
+        "index": db_ok,
         "ollama_error": ollama_err
     }
 

@@ -1,4 +1,5 @@
 .vectorai_db/
+.codelens_index/
 node_modules/
 dist/
 out/
@@ -9,6 +10,7 @@ last_repo.json
 .DS_Store
 *.vsix
 .vectorai_db/
+.codelens_index/
 last_repo.json
 *.vsix
 node_modules/
