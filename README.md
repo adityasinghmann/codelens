@@ -9,7 +9,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3+-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://typescriptlang.org)
 [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?style=flat-square&logo=visual-studio-code&logoColor=white)](https://code.visualstudio.com)
 [![Ollama](https://img.shields.io/badge/Ollama-nomic--embed--text-FFA500?style=flat-square)](https://ollama.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+
 
 **Ask a question in plain English. Get the functions that answer it. Jump to the line.**
 No internet, no API keys, no data leaving the machine.
@@ -496,6 +496,5 @@ CodeLens/
 
 ---
 
-## License
 
-MIT — see [LICENSE](LICENSE).
+
