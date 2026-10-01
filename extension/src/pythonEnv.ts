@@ -232,7 +232,12 @@ export async function ensureBackendEnv(context: vscode.ExtensionContext): Promis
         async (progress) => {
             progress.report({ message: 'creating virtual environment' });
             try {
-                await execFileAsync(baseExe, [...baseArgs, '-m', 'venv', venvDir], { timeout: 300000 });
+                // --clear: a rebuild must start empty. On Windows site-packages
+                // is not versioned (Lib\site-packages), so reusing it after a
+                // Python upgrade left compiled wheels for the old version that
+                // pip reported as "already satisfied" and that then failed to
+                // import - permanently, because the stamp was still written.
+                await execFileAsync(baseExe, [...baseArgs, '-m', 'venv', '--clear', venvDir], { timeout: 300000 });
             } catch (err) {
                 throw new BackendSetupError(
                     `Failed to create a Python virtual environment at ${venvDir}: ${describe(err)}`,
@@ -258,6 +263,21 @@ export async function ensureBackendEnv(context: vscode.ExtensionContext): Promis
                 throw new BackendSetupError(
                     `Installing the CodeLens backend dependencies failed: ${describe(err)}`,
                     `Run "${interpreter} -m pip install -r ${requirementsPath}" in a terminal to see the full pip output. A missing C toolchain, or no available wheel for Python ${pythonVersion}, is the usual cause.`,
+                );
+            }
+
+            // Prove the environment can actually run the backend before
+            // recording it as good: importing it loads every compiled
+            // dependency (numpy, tree-sitter, pydantic-core). Without the
+            // stamp, the next activation rebuilds instead of reusing a broken
+            // environment forever.
+            progress.report({ message: 'verifying the backend imports' });
+            try {
+                await execFileAsync(interpreter, ['-c', 'import backend.main'], { cwd: extensionRoot, timeout: 120000 });
+            } catch (err) {
+                throw new BackendSetupError(
+                    `The CodeLens backend could not be imported in its new environment: ${describe(err)}`,
+                    `Run "${interpreter} -c \\"import backend.main\\"" from ${extensionRoot} to see the full error. Reloading the window rebuilds the environment.`,
                 );
             }
 

@@ -6,6 +6,10 @@
 # ============================================================
 set -e
 
+# Run from the repository root whatever directory the script was invoked from:
+# requirements.txt, ./.codelens_index and the npm build are all relative to it.
+cd "$(dirname "$0")"
+
 PYTHON=""
 OLLAMA_BIN=""
 
@@ -108,22 +112,9 @@ ok "nomic-embed-text ready"
 # ────────────────────────────────────────────────────────────
 echo "▶ Installing Python dependencies..."
 "$PYTHON" -m pip install --quiet --upgrade pip
-"$PYTHON" -m pip install --quiet \
-    "fastapi>=0.110.0" \
-    "uvicorn[standard]>=0.29.0" \
-    "pydantic>=2.6.4" \
-    "ollama>=0.5.0" \
-    "tree-sitter>=0.22.0" \
-    tree-sitter-python \
-    tree-sitter-typescript \
-    tree-sitter-javascript \
-    tree-sitter-go \
-    tree-sitter-rust \
-    tree-sitter-java \
-    "watchdog>=4.0.0" \
-    "rich>=13.7.1" \
-    "numpy>=1.26.0" \
-    "python-dotenv>=1.0.1"
+# requirements.txt is the single source of truth, including the tree-sitter
+# <0.26 pin that prevents segfaults. A hand-copied list here had drifted from it.
+"$PYTHON" -m pip install --quiet -r requirements.txt
 ok "Python dependencies installed"
 
 # ────────────────────────────────────────────────────────────

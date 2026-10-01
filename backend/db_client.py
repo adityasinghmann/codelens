@@ -100,8 +100,15 @@ def normalize_rel_path(rel_path: str) -> str:
     Always forward slashes: os.path.relpath yields backslashes on Windows, and
     storing those would make the same repository index differently depending on
     the host OS, and break jump-to-file across platforms.
+
+    Only a literal "./" prefix and leading slashes are removed. str.lstrip("./")
+    would strip every leading "." too, turning ".github/ci.yml" into
+    "github/ci.yml" - a path that does not exist.
     """
-    return rel_path.replace(os.sep, "/").replace("\\", "/").lstrip("./")
+    path = rel_path.replace(os.sep, "/").replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path.lstrip("/")
 
 
 def file_id_for(repo_id: str, rel_path: str) -> str:
@@ -273,7 +280,14 @@ class LocalVectorStore:
     # -- repositories ------------------------------------------------------
 
     def ensure_repository(self, root_path: str) -> str:
-        """Register a repository (idempotent) and return its repo_id."""
+        """
+        Register a repository (idempotent) and return its repo_id.
+
+        An existing row is left untouched. updated_at means "last indexed" -
+        it is reported as last_indexed and orders "most recently indexed" -
+        so only touch_repository(), at the end of a successful index, moves
+        it. Bumping it here made every backend restart look like an index run.
+        """
         repo_id = repo_id_for(root_path)
         # Identity is case-folded; the stored path keeps the user's casing.
         display = display_root(root_path)
@@ -282,7 +296,7 @@ class LocalVectorStore:
             conn.execute(
                 "INSERT INTO repositories (repo_id, root_path, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at",
+                "ON CONFLICT(repo_id) DO NOTHING",
                 (repo_id, display, now, now),
             )
             conn.commit()
@@ -548,10 +562,11 @@ class LocalVectorStore:
             params.append(symbol_type)
         if path_prefix:
             prefix = normalize_rel_path(path_prefix)
-            # LIKE with an escaped prefix; the index on (repo_id, file_path)
-            # makes this a range scan rather than a table scan.
-            where.append("file_path LIKE ? ESCAPE '\\'")
-            params.append(prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+            # Exact, case-sensitive prefix comparison. SQLite's LIKE ignores
+            # ASCII case, so "backend/" also matched a different directory
+            # "Backend/". substr() has no wildcards, so nothing needs escaping.
+            where.append("substr(file_path, 1, ?) = ?")
+            params.extend([len(prefix), prefix])
 
         clause = " AND ".join(where)
 

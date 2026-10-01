@@ -119,7 +119,18 @@ Node types are split into two kinds, which matters more than it sounds:
   Emitted whole; the walk stops there, because the body belongs to the symbol.
 - **Containers** — classes, interfaces, `impl` blocks, structs, traits, enums.
   Emitted *header-only*: the declaration, docstring and field declarations,
-  with nested leaf bodies removed. The walk continues inside.
+  with the bodies of nested methods and nested classes removed (each is its
+  own chunk). The walk continues inside. A decorated class, such as a
+  `@dataclass`, is a container like any other.
+- **Module-level code** — anything no symbol covers: module-level assignments
+  and config, handlers passed inline to a call such as `app.post(...)`, Go
+  `var` blocks. Each contiguous run becomes a `code` chunk (windowed if long),
+  so a file with one function does not lose everything around it. Runs made
+  only of imports or closing brackets are skipped.
+
+Go types are one chunk each (`type ( A struct{}; B int )` gives `A` and `B`),
+typed `struct`, `interface` or `type`. A Rust `impl Trait for Type` is named and
+scopes its methods by `Type`.
 
 Without that split, a class is emitted once containing all its methods and then
 again as one chunk per method — the same source embedded twice, competing with
@@ -197,7 +208,10 @@ never touches another.
 ### Watcher behaviour
 
 A `watchdog` observer handles **create, modify, delete and move** — a move is a
-removal of the old path plus an index of the new one. Events are debounced per
+removal of the old path plus an index of the new one. It covers every file type
+the full index walks, including `.md`, `.txt`, `.toml` and `.yaml`. Each
+repository indexed during a backend session gets its own watcher, so every
+folder of a multi-root workspace stays current. Events are debounced per
 path (500 ms) so the burst an editor emits for one save causes one index pass,
 and all work is serialised onto a single long-lived background loop, so two
 operations for the same file can never overlap.
@@ -256,6 +270,23 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 `setup.sh` and `start.sh` do the same for macOS and Linux. On Windows, use the
 extension, which provisions its own environment.
 
+### Running with Docker
+
+```bash
+CODELENS_REPOS_DIR=/path/to/your/code docker compose up --build
+curl -X POST http://127.0.0.1:8000/index -H 'Content-Type: application/json' \
+     -d '{"repo_path": "/repos"}'
+```
+
+This starts the backend and an Ollama container, which pulls
+`nomic-embed-text` on first start. Both ports are published on the host's
+loopback only. `CODELENS_REPOS_DIR` (default: this directory) is mounted
+read-only at `/repos`, and repositories are indexed and queried by that
+container path, so this mode is for driving the API directly — the VS Code
+extension sends host paths and runs its own backend. On Docker Desktop, file
+change events from the host may not reach the container, so re-index after
+editing.
+
 ### Configuration
 
 VS Code settings:
@@ -272,13 +303,14 @@ Backend environment variables (see `.env.example`):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CODELENS_INDEX_PATH` | `./.codelens_index` | Index directory. (`VECTORAI_DB_PATH` still honoured.) |
+| `CODELENS_INDEX_PATH` | `./.codelens_index` | Index directory. (`VECTORAI_DB_PATH` still honoured.) The extension sets it to `index/` in its VS Code global storage, so the index survives extension updates. |
+| `CODELENS_ALLOWED_HOSTS` | `127.0.0.1,localhost` | `Host` header values the API answers to. |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama address. |
 | `EMBED_MODEL` | `nomic-embed-text` | Model for chunks *and* queries. |
 | `EXPLAIN_MODEL` | `mistral` | Model for optional explain summaries. |
 | `EMBED_CONCURRENCY` | `4` | Concurrent embedding requests, bounded. |
 | `EMBED_BATCH_SIZE` | `20` | Chunks per batch. |
-| `TOP_K` | `10` | Default result count. |
+| `TOP_K` | `10` | Result count for a `/query` that omits `top_k`, clamped to 1–20. The sidebar always asks for 8. |
 
 ### Supported languages
 
@@ -311,12 +343,14 @@ Responds with `text/event-stream`, each event `data: <json>\n\n`:
 {"type":"progress","file":"src/auth.py","processed_files":12,"total_files":240,"processed_chunks":318}
 {"type":"error","file":"src/broken.py","message":"..."}
 {"type":"complete","total_files":240,"processed_files":240,"total_chunks":6104,
- "stored":83,"skipped":6021,"failed":0,"duration_ms":41200}
+ "stored":83,"skipped":6021,"failed":0,"removed_files":0,"duration_ms":41200}
 ```
 
 `processed_files` and `total_files` share a unit, so their ratio is real
 progress; a file that fails to parse still advances it, so the stream always
-reaches 100%. `stored`, `skipped` and `failed` are actual counts from the diff.
+reaches 100%. `stored`, `skipped` and `failed` are actual counts from the diff;
+what is searchable afterwards is `stored + skipped`, not `total_chunks`.
+`removed_files` counts stored files no longer on disk, which every run prunes.
 
 - `400` — `repo_path` missing, nonexistent, or not a directory
 - `409` — an index of that same repository is already running
@@ -329,9 +363,11 @@ reaches 100%. `stored`, `skipped` and `failed` are actual counts from the diff.
  "language": "python", "path_prefix": "backend/", "symbol_type": "method"}
 ```
 
-`top_k` is 1–20. `repo_path` scopes the search; omitted, the most recently
+`top_k` is 1–20; omitted, the `TOP_K` setting is used (clamped to that range).
+`repo_path` scopes the search; omitted, the most recently
 indexed repository is used. The three filters are optional and applied in SQL
-before scoring.
+before scoring. `path_prefix` is an exact, case-sensitive prefix of the
+repository-relative path.
 
 ```json
 {
@@ -369,8 +405,13 @@ probability and not a confidence.**
 {"ollama": true, "index": true, "ollama_error": null}
 ```
 
+`index` is true only when a query against the index database succeeds.
+
 CORS is restricted to `vscode-webview://*`; the extension host sends no
-`Origin` and is unaffected.
+`Origin` and is unaffected. Requests must also carry a loopback `Host`
+(`127.0.0.1` or `localhost`, set by `CODELENS_ALLOWED_HOSTS`); anything else
+gets `400`. CORS alone does not stop DNS rebinding, where a web page re-points
+its own domain at `127.0.0.1` and so counts as same-origin.
 
 ---
 
@@ -379,8 +420,12 @@ CORS is restricted to `vscode-webview://*`; the extension host sends no
 | Feature | Behaviour |
 |---|---|
 | Sidebar search | Natural-language input, ranked cards with symbol kind, language and line range |
-| Jump to file | Opens at the exact line. The path is resolved and verified to stay inside the workspace before opening. |
-| Re-index | `POST /index` with a properly buffered SSE progress bar |
+| Jump to file | Opens at the exact line. The path is resolved and verified to stay inside its workspace folder before opening. |
+| Re-index | `POST /index` with a properly buffered SSE progress bar. In a multi-root workspace, pick one folder or all of them. Run from the Command Palette or editor title bar, it opens the sidebar first. A file that fails is reported under the bar without stopping the run; chunks that could not be embedded are reported, never counted as indexed. |
+| Copy | Copies a result's code to the clipboard |
+| Several VS Code windows | Later windows use the first window's backend. If it goes away, a remaining window starts its own within seconds. |
+| Multi-root workspaces | Search covers every indexed folder, merged into one ranking; each hit shows which folder it came from |
+| Sidebar safety | Every value from the index or the LLM is HTML-escaped, and a Content-Security-Policy with a per-load nonce means only the panel's own script can run |
 | Status bar | Chunk count while healthy; distinct text for starting, offline, stopped and crashed |
 | Restart backend | Offered automatically when the backend crashes mid-session |
 | Explain mode | Optional local-LLM summary of the top hits |
@@ -392,10 +437,10 @@ CORS is restricted to `vscode-webview://*`; the extension host sends no
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest              # 145 tests
+python -m pytest              # 176 tests
 
 npm install
-npm test                      # 32 Jest tests
+npm test                      # 55 Jest tests
 ```
 
 **No test requires a running Ollama, a model, or any network access** —
@@ -434,9 +479,9 @@ Current, real, and worth knowing before relying on this:
   you re-index, rather than returning meaningless scores.
 - **The schema version drops and rebuilds on mismatch.** The index is a cache;
   an upgrade means re-indexing.
-- **One backend process, one watcher.** The watcher follows the most recently
-  indexed repository. Several repositories can be *indexed and searched*
-  independently, but only one is watched live.
+- **Watchers last for one backend session.** Every repository indexed while the
+  backend runs is watched live, but after a restart only the most recently
+  indexed one is watched again until the others are re-indexed.
 - **No ranking beyond cosine similarity** — no reranking, no hybrid keyword
   scoring, no call-graph awareness.
 - **Container chunks are header-only**, so a query matching text that only
@@ -457,7 +502,6 @@ Not implemented. Nothing in this section exists in the code.
 - An approximate index (HNSW/IVF) for repositories where linear scan stops being
   acceptable
 - Hybrid retrieval combining keyword and vector scoring
-- Watching more than one repository at once
 - A `.codelensignore` file
 - Reusing git to bound re-indexing to changed files
 - Cross-file relationships ("callers of this")
@@ -484,6 +528,7 @@ CodeLens/
 │   │   ├── toolResolver.ts     # Cross-platform Python/Ollama resolution
 │   │   ├── sseParser.ts        # Incremental SSE parser
 │   │   ├── paths.ts            # Workspace containment
+│   │   ├── multiRoot.ts        # Multi-root result merge + folder validation
 │   │   ├── apiTypes.ts         # TypeScript mirror of the contract
 │   │   ├── config.ts           # Settings + API base URL
 │   │   └── searchPanel.ts      # Webview provider
@@ -491,6 +536,8 @@ CodeLens/
 │   └── test/                   # Jest tests
 ├── tests/                      # pytest suite
 ├── requirements.txt            # Bundled into the .vsix, installed on first run
+├── backend.Dockerfile          # Backend image for docker-compose.yml
+├── docker-compose.yml          # Backend + Ollama, loopback-only
 └── .github/workflows/ci.yml
 ```
 

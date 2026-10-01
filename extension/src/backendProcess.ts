@@ -10,6 +10,7 @@
  *    first signal (and Windows has no signals at all - see stop()).
  */
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, ChildProcess } from 'child_process';
 import axios from 'axios';
@@ -27,6 +28,11 @@ const POLL_INTERVAL_MS = 250;
 const PROBE_TIMEOUT_MS = 2500;
 /** Grace period between SIGINT and SIGTERM, and between SIGTERM and SIGKILL. */
 const SIGNAL_GRACE_MS = 2000;
+/**
+ * How often to check a backend this window adopted rather than started. Its
+ * owner (another VS Code window) can close at any time, taking it down.
+ */
+const ADOPTED_PROBE_MS = 5000;
 
 export type BackendState = 'stopped' | 'starting' | 'ready' | 'failed';
 
@@ -56,12 +62,17 @@ export class BackendController {
     /** Guards against two concurrent start() calls racing on one port. */
     private starting: Promise<boolean> | undefined;
     private stderrTail: string[] = [];
+    /** Set while serving through a backend some other process started. */
+    private adoptedTimer: NodeJS.Timeout | undefined;
 
     private readonly emitter = new vscode.EventEmitter<BackendStatusEvent>();
     /** Fires on every state transition. */
     public readonly onDidChangeState = this.emitter.event;
 
-    constructor(private readonly context: vscode.ExtensionContext) {}
+    constructor(
+        private readonly context: vscode.ExtensionContext,
+        private readonly options: { adoptedProbeMs?: number } = {},
+    ) {}
 
     public getState(): BackendState {
         return this.state;
@@ -101,15 +112,18 @@ export class BackendController {
             return this.fail(err);
         }
 
-        // If something is already serving on the port (a leftover process, or a
-        // backend the developer started by hand), adopt it rather than fighting
-        // over the port.
+        // If something is already serving on the port (another VS Code window's
+        // backend, a leftover process, or one the developer started by hand),
+        // adopt it rather than fighting over the port.
         if (await probeHealth()) {
-            this.setState('ready');
+            this.adopt();
             return true;
         }
 
         let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+        // A spawn failure (ENOENT, EACCES) emits 'error' and 'close' but never
+        // 'exit', so it needs its own flag or startup polls until the timeout.
+        let launchFailed = false;
 
         // Locating Ollama is best-effort at spawn time: the backend talks to it
         // over HTTP, so a missing CLI is not fatal here. Finding it lets us put
@@ -117,6 +131,16 @@ export class BackendController {
         // GUI and did not inherit a login shell's PATH. /health reports the
         // real reachability, and activate() warns from that.
         const childEnv: NodeJS.ProcessEnv = { ...process.env, OLLAMA_HOST: getOllamaHost() };
+
+        // Keep the index in the extension's global storage. The backend's
+        // default, ./.codelens_index, resolves inside the extension's install
+        // directory (the process cwd), which VS Code deletes on every update.
+        // An explicit environment setting still wins.
+        if (!process.env.CODELENS_INDEX_PATH && !process.env.VECTORAI_DB_PATH) {
+            const indexPath = path.join(this.context.globalStorageUri.fsPath, 'index');
+            migrateLegacyIndex(path.join(env.extensionRoot, '.codelens_index'), indexPath);
+            childEnv.CODELENS_INDEX_PATH = indexPath;
+        }
         try {
             const ollama = await resolveOllama(getOllamaSetting());
             const prefix = pathPrefixFor(ollama);
@@ -159,6 +183,8 @@ export class BackendController {
         });
 
         this.child.on('error', (err) => {
+            launchFailed = true;
+            this.child = undefined;
             this.fail(
                 new BackendSetupError(
                     `CodeLens could not launch the backend process: ${err.message}`,
@@ -182,7 +208,17 @@ export class BackendController {
         // Poll /health until it answers, the child dies, or we run out of time.
         const deadline = Date.now() + getStartupTimeoutMs();
         while (Date.now() < deadline) {
+            if (launchFailed) {
+                // Already reported once, by the 'error' handler.
+                return false;
+            }
             if (exited) {
+                // Two windows starting at once: the other one's backend won the
+                // port and ours exited on "address already in use". Use theirs.
+                if (await probeHealth()) {
+                    this.adopt();
+                    return true;
+                }
                 return this.fail(
                     new BackendSetupError(
                         `The CodeLens backend exited during startup (${describeExit(exited.code, exited.signal)}).${this.stderrSummary()}`,
@@ -224,6 +260,49 @@ export class BackendController {
     }
 
     /**
+     * Serve through a backend this window did not start, and keep checking it.
+     * Its owner - usually another VS Code window - can shut it down at any
+     * time. Without the check this window kept reporting "ready" against a
+     * dead port and never offered to recover.
+     */
+    private adopt() {
+        this.stopAdoptedWatch();
+        this.setState('ready');
+        let probing = false;
+        this.adoptedTimer = setInterval(async () => {
+            if (probing) {
+                return;
+            }
+            probing = true;
+            try {
+                if (!(await probeHealth()) && this.adoptedTimer) {
+                    this.stopAdoptedWatch();
+                    console.warn('[CodeLens] The adopted backend went away; starting our own.');
+                    this.setState('starting');
+                    // Jitter, so several windows noticing at once do not all
+                    // race for the port; the losers adopt the winner.
+                    setTimeout(() => {
+                        // Unless stop() or a restart intervened meanwhile.
+                        if (this.state === 'starting' && !this.starting) {
+                            void this.start();
+                        }
+                    }, Math.floor(Math.random() * 1000));
+                }
+            } finally {
+                probing = false;
+            }
+        }, this.options.adoptedProbeMs ?? ADOPTED_PROBE_MS);
+        this.adoptedTimer.unref?.();
+    }
+
+    private stopAdoptedWatch() {
+        if (this.adoptedTimer) {
+            clearInterval(this.adoptedTimer);
+            this.adoptedTimer = undefined;
+        }
+    }
+
+    /**
      * Terminate the backend and confirm it is actually gone.
      *
      * SIGINT is what uvicorn documents for a clean shutdown, but a wedged
@@ -234,6 +313,7 @@ export class BackendController {
      * rather than assuming it.
      */
     public async stop(): Promise<void> {
+        this.stopAdoptedWatch();
         const child = this.child;
         if (!child || child.exitCode !== null || child.killed) {
             this.child = undefined;
@@ -291,6 +371,29 @@ export class BackendController {
         }
         const lastLines = tail.split('\n').slice(-4).join(' ').trim();
         return ` Last output: ${lastLines}`;
+    }
+}
+
+/**
+ * Move an index left in the old location (inside the extension's install
+ * directory) to its new home, once. Best effort: failing to move it only means
+ * re-indexing.
+ */
+export function migrateLegacyIndex(legacyDir: string, targetDir: string): void {
+    try {
+        if (!fs.existsSync(legacyDir) || fs.existsSync(targetDir)) {
+            return;
+        }
+        fs.mkdirSync(path.dirname(targetDir), { recursive: true });
+        try {
+            fs.renameSync(legacyDir, targetDir);
+        } catch {
+            // Different volume: copy instead, and leave the original.
+            fs.cpSync(legacyDir, targetDir, { recursive: true });
+        }
+        console.log(`[CodeLens] Moved the index from ${legacyDir} to ${targetDir}.`);
+    } catch (err) {
+        console.warn(`[CodeLens] Could not move the old index from ${legacyDir}: ${err instanceof Error ? err.message : String(err)}`);
     }
 }
 

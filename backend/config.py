@@ -17,6 +17,14 @@ class Settings:
 
     OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
+    # Host header values the API answers to. Loopback names only by default:
+    # a DNS-rebinding page reaches 127.0.0.1 under its own domain name, and
+    # rejecting that Host is what stops it reading indexed code.
+    ALLOWED_HOSTS: list[str] = [
+        h.strip() for h in os.getenv("CODELENS_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+        if h.strip()
+    ]
+
     # Model used to embed both indexed chunks and incoming queries. Both sides
     # must use the same model for the vectors to be comparable at all.
     EMBED_MODEL: str = os.getenv("EMBED_MODEL", "nomic-embed-text")
@@ -25,7 +33,8 @@ class Settings:
     # at the call site in query.py.
     EXPLAIN_MODEL: str = os.getenv("EXPLAIN_MODEL", "mistral")
 
-    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "512"))
+    # Result count for a POST /query that does not send top_k. Clamped to the
+    # API's 1..20 range where it is used, in main.default_top_k().
     TOP_K: int = int(os.getenv("TOP_K", "10"))
 
     # How many embedding requests may be in flight at once. Bounded on purpose:

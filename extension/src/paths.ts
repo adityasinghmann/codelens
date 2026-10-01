@@ -26,9 +26,11 @@ export function resolveInsideRoot(root: string, candidate: string): string | nul
     const resolved = path.resolve(absoluteRoot, candidate);
     const relative = path.relative(absoluteRoot, resolved);
 
-    // '' means the candidate resolved to the root itself; a '..' prefix or an
-    // absolute result means it escaped.
-    if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+    // '' means the candidate resolved to the root itself; a leading '..'
+    // SEGMENT or an absolute result means it escaped. A bare startsWith('..')
+    // also refused legitimate names such as "..notes.md".
+    const escapes = relative === '..' || relative.startsWith(`..${path.sep}`);
+    if (relative === '' || escapes || path.isAbsolute(relative)) {
         return null;
     }
     return resolved;

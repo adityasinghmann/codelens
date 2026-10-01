@@ -3,6 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!--
+        Only this page's own script may run: it carries a nonce that
+        searchPanel.ts generates fresh for every load. Search results contain
+        repository text and LLM output, so injected markup must not be able to
+        execute anything even if an escape were ever missed.
+    -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{{nonce}}';">
     <title>CodeLens Dashboard</title>
     <style>
         :root {
@@ -363,6 +371,21 @@
             width: 0%;
             transition: width 0.2s ease;
         }
+        .notice {
+            border-left: 3px solid var(--bar-amber);
+            padding: 6px 10px;
+            margin-bottom: 16px;
+            font-size: 12px;
+            color: var(--vscode-descriptionForeground);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .prog-errors {
+            margin-top: 10px;
+            font-size: 11px;
+            color: var(--bar-amber);
+            word-break: break-word;
+        }
         .progress-filename {
             font-family: var(--vscode-editor-font-family);
             font-size: 11px;
@@ -405,7 +428,11 @@
     </div>
     
     <div id="explain-container"></div>
-    
+
+    <!-- Warnings that do not replace the results: partial index failures,
+         workspace folders that could not be searched. -->
+    <div id="notice-container" class="notice hidden"></div>
+
     <!-- Active Background Processing Queue Screen -->
     <div id="progress-container" class="progress-view hidden">
         <div class="progress-filename" id="prog-file">...</div>
@@ -415,6 +442,7 @@
         <div style="font-size: 11px; color: var(--vscode-descriptionForeground);" id="prog-text">
             <span id="prog-files">0 / 0 files</span> · <span id="prog-pct">0</span>% · <span id="prog-chunks">0</span> chunks
         </div>
+        <div class="prog-errors hidden" id="prog-errors"></div>
     </div>
 
     <!-- Ranked search results -->
@@ -426,7 +454,7 @@
         </div>
     </ul>
 
-    <script>
+    <script nonce="{{nonce}}">
         const vscode = acquireVsCodeApi();
         
         const uiTokens = {
@@ -447,21 +475,88 @@
             progBar: document.getElementById('prog-bar'),
             progPct: document.getElementById('prog-pct'),
             progChunks: document.getElementById('prog-chunks'),
-            progFiles: document.getElementById('prog-files')
+            progFiles: document.getElementById('prog-files'),
+            progErrors: document.getElementById('prog-errors'),
+            noticeCont: document.getElementById('notice-container')
         };
-        
+
         let navigationIndex = -1;
         let resultElements = [];
+        let fileErrorCount = 0;
 
-        // Inline lightweight custom minified stub executing high performance DOM render constraints matching user spec without fetching via Cloud CDN
+        /**
+         * Put the example queries back. They live inside the results list, so
+         * clearing the list detaches them; the old code then looked them up
+         * by id, found nothing, and they never came back after a search.
+         */
+        function showEmptyState() {
+            uiTokens.resultsCont.innerHTML = '';
+            if (uiTokens.emptyState) {
+                uiTokens.resultsCont.appendChild(uiTokens.emptyState);
+                uiTokens.emptyState.classList.remove('hidden');
+            }
+        }
+
+        /** Show the progress view, whichever command started the re-index. */
+        function showProgressView() {
+            uiTokens.resultsCont.innerHTML = '';
+            uiTokens.metaRow.classList.add('hidden');
+            uiTokens.explainCont.innerHTML = '';
+            setNotices([]);
+            fileErrorCount = 0;
+            uiTokens.progErrors.textContent = '';
+            uiTokens.progErrors.classList.add('hidden');
+            uiTokens.progBar.style.width = '0%';
+            uiTokens.progCont.classList.remove('hidden');
+        }
+
+        /** Replace the notice area's contents; plain text, never markup. */
+        function setNotices(lines) {
+            const list = (lines || []).filter(Boolean);
+            uiTokens.noticeCont.textContent = list.join('\n');
+            uiTokens.noticeCont.classList.toggle('hidden', list.length === 0);
+        }
+
+        /**
+         * Escape text for use in HTML content or a quoted attribute. Every
+         * value that reaches innerHTML goes through this: file paths, symbol
+         * names and code come from the repository, and explain_text is LLM
+         * output shaped by that code.
+         */
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        /**
+         * Minimal single-pass highlighter. One regex finds the next string,
+         * comment, keyword or number; the text between tokens and each token
+         * itself are escaped exactly once. The previous chain of .replace()
+         * calls ran the keyword pass over its own <span class="..."> markup,
+         * matched the word "class", and produced broken HTML.
+         */
+        const TOKEN = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(\/\/.*|\/\*[\s\S]*?\*\/|#.*)|\b(function|def|class|struct|impl|import|export|if|else|return|const|let|var|await|async|type|interface|public|private)\b|\b(\d+(?:\.\d+)?)\b/g;
+
         const syntaxParser = {
             highlight: (code) => {
-                return code
-                    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") 
-                    .replace(/("(?:\\"|[^"])*"|'(?:\\'|[^'])*')/g, '<span class="hljs-string">$1</span>')
-                    .replace(/(\/\/.*|\/\*[\s\S]*?\*\/|#.*)/g, '<span class="hljs-comment">$1</span>')
-                    .replace(/\b(function|def|class|struct|impl|import|export|if|else|return|const|let|var|await|async|type|interface|public|private)\b/g, '<span class="hljs-keyword">$1</span>')
-                    .replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="hljs-number">$1</span>');
+                const source = String(code ?? '');
+                let html = '';
+                let last = 0;
+                for (const match of source.matchAll(TOKEN)) {
+                    const [text, str, comment, keyword] = match;
+                    const cls = str ? 'hljs-string'
+                        : comment ? 'hljs-comment'
+                        : keyword ? 'hljs-keyword'
+                        : 'hljs-number';
+                    html += escapeHtml(source.slice(last, match.index));
+                    html += `<span class="${cls}">${escapeHtml(text)}</span>`;
+                    last = match.index + text.length;
+                }
+                return html + escapeHtml(source.slice(last));
             }
         };
 
@@ -480,7 +575,8 @@
             spawnShimmerLoaders();
             uiTokens.metaRow.classList.add('hidden');
             uiTokens.explainCont.innerHTML = '';
-            
+            setNotices([]);
+
             vscode.postMessage({
                 type: 'query',
                 text: raw,
@@ -490,14 +586,8 @@
 
         uiTokens.btnSearch.addEventListener('click', execSearchWorkflow);
         uiTokens.btnReindex.addEventListener('click', () => {
-             uiTokens.resultsCont.innerHTML = '';
-             uiTokens.metaRow.classList.add('hidden');
-             uiTokens.explainCont.innerHTML = '';
-             uiTokens.emptyState?.classList.add('hidden');
-             
-             uiTokens.progCont.classList.remove('hidden');
-             uiTokens.progBar.style.width = '0%';
-             vscode.postMessage({ type: 'reindex' });
+            showProgressView();
+            vscode.postMessage({ type: 'reindex' });
         });
 
         uiTokens.input.addEventListener('keydown', (e) => {
@@ -547,17 +637,20 @@
                         uiTokens.chunkBadge.innerText = `${stream.total_indexed} chunks`;
                     }
                     
+                    // Workspace folders that could not be searched, and why.
+                    setNotices(stream.notices);
+
                     if (stream.explain_text) {
                         uiTokens.explainCont.innerHTML = `
                             <div class="ai-explanation">
                                 <strong>AI Core Detail Analysis:</strong><br>
-                                ${stream.explain_text}
+                                ${escapeHtml(stream.explain_text)}
                             </div>
                         `;
                     }
 
                     if (stream.data.length === 0) {
-                        uiTokens.resultsCont.innerHTML = `<div style="text-align: center; color: var(--vscode-descriptionForeground); margin-top:20px;">No exact matches found structure. Consider attempting an internal index reload tracking mechanism.</div>`;
+                        uiTokens.resultsCont.innerHTML = `<div style="text-align: center; color: var(--vscode-descriptionForeground); margin-top:20px;">No matches. Try rephrasing the question, or re-index if the code has changed.</div>`;
                         return;
                     }
 
@@ -565,35 +658,49 @@
                     navigationIndex = -1;
 
                     stream.data.forEach((r, idx) => {
-                        const calculatedWidth = (Math.max(0, Math.min(1, r.score)) * 100).toFixed(0);
-                        const severityClassColor = deriveMetricIntensity(r.score);
-                        
+                        const score = Math.max(0, Math.min(1, Number(r.score) || 0));
+                        const calculatedWidth = (score * 100).toFixed(0);
+                        const severityClassColor = deriveMetricIntensity(score);
+                        const startLine = Number(r.start_line) || 0;
+                        const endLine = Number(r.end_line) || 0;
+                        // In a multi-root workspace, say which folder a hit is from.
+                        const shownPath = r.folder ? `${r.folder}/${r.file_path}` : r.file_path;
+
                         const li = document.createElement('li');
                         li.className = 'result-card';
                         li.style.animationDelay = `${idx * 50}ms`;
-                        
+
                         li.innerHTML = `
                             <div class="card-header">
-                                <span class="filename">${r.file_path}</span>
-                                <span class="line-range">${r.language ? r.language + ' · ' : ''}line ${r.start_line}–${r.end_line}</span>
+                                <span class="filename">${escapeHtml(shownPath)}</span>
+                                <span class="line-range">${r.language ? escapeHtml(r.language) + ' · ' : ''}line ${startLine}–${endLine}</span>
                             </div>
                             <div class="symbol-row">
-                                <span class="symbol-name" title="${r.qualified_name || r.symbol_name}">${r.symbol_type ? `<span class="symbol-kind">${r.symbol_type}</span>` : ''}${r.symbol_name}</span>
+                                <span class="symbol-name" title="${escapeHtml(r.qualified_name || r.symbol_name)}">${r.symbol_type ? `<span class="symbol-kind">${escapeHtml(r.symbol_type)}</span>` : ''}${escapeHtml(r.symbol_name)}</span>
                                 <div class="score-wrap">
                                     <div class="score-track"><div class="score-fill" style="width: ${calculatedWidth}%; background-color: ${severityClassColor};"></div></div>
-                                    ${(r.score).toFixed(2)}
+                                    ${score.toFixed(2)}
                                 </div>
                             </div>
                             <div class="divider"></div>
                             <pre class="code-block">${syntaxParser.highlight(r.chunk_text)}</pre>
                             <div class="card-actions">
-                                <button class="ghost-btn jump-btn" data-file="${r.file_path}" data-line="${r.start_line}">Jump to file →</button>
+                                <button class="ghost-btn jump-btn">Jump to file →</button>
                                 <button class="ghost-btn cp-btn">Copy</button>
                             </div>
                         `;
-                        
+
                         li.querySelector('.jump-btn').addEventListener('click', () => {
-                            vscode.postMessage({ type: 'jumpTo', file: r.file_path, line: r.start_line });
+                            vscode.postMessage({ type: 'jumpTo', root: r.root, file: r.file_path, line: startLine });
+                        });
+
+                        // The extension host writes the clipboard: it works
+                        // regardless of webview focus and clipboard permissions.
+                        const copyBtn = li.querySelector('.cp-btn');
+                        copyBtn.addEventListener('click', () => {
+                            vscode.postMessage({ type: 'copy', text: String(r.chunk_text ?? '') });
+                            copyBtn.textContent = 'Copied ✓';
+                            setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
                         });
                         
                         uiTokens.resultsCont.appendChild(li);
@@ -602,10 +709,15 @@
                     
                     break;
                     
+                case 'indexStarted':
+                    showProgressView();
+                    break;
+
                 case 'indexProgress': {
                     // pct is files-processed / files-total, already clamped to
                     // 0-100 by the extension host.
                     const pct = Math.max(0, Math.min(100, Number(stream.pct) || 0));
+                    uiTokens.progCont.classList.remove('hidden');
                     uiTokens.progFile.innerText = stream.file;
                     uiTokens.progBar.style.width = `${pct}%`;
                     uiTokens.progPct.innerText = Math.round(pct);
@@ -615,20 +727,45 @@
                     break;
                 }
                     
-                case 'status':
+                case 'indexFileError':
+                    // One file failed; the run continues, so keep the progress
+                    // view and report the failure underneath it.
+                    fileErrorCount += 1;
+                    uiTokens.progErrors.textContent =
+                        `${fileErrorCount} file${fileErrorCount === 1 ? '' : 's'} could not be indexed. Last: ${stream.file}: ${stream.message}`;
+                    uiTokens.progErrors.classList.remove('hidden');
+                    break;
+
+                case 'status': {
+                    // chunks is what is actually searchable, not what was parsed.
                     uiTokens.progCont.classList.add('hidden');
                     uiTokens.chunkBadge.innerText = `${stream.chunks} chunks`;
-                    uiTokens.healthDot.className = 'status-dot'; 
-                    document.getElementById('empty-state')?.classList.remove('hidden');
+                    const failed = Number(stream.failed) || 0;
+                    uiTokens.healthDot.className = failed > 0 ? 'status-dot amber' : 'status-dot';
+                    setNotices(failed > 0
+                        ? [`${failed} chunk${failed === 1 ? '' : 's'} could not be embedded and ${failed === 1 ? 'is' : 'are'} not searchable. Check that Ollama is running, then re-index.`]
+                        : []);
+                    showEmptyState();
                     break;
+                }
                     
                 case 'error':
                     uiTokens.progCont.classList.add('hidden');
                     uiTokens.healthDot.className = 'status-dot red';
-                    uiTokens.resultsCont.innerHTML = `<div style="color: var(--bar-red);">${stream.message}</div>`;
+                    uiTokens.resultsCont.innerHTML = `<div style="color: var(--bar-red);">${escapeHtml(stream.message)}</div>`;
+                    break;
+
+                case 'indexCancelled':
+                    // The user dismissed the folder picker: undo the progress view.
+                    uiTokens.progCont.classList.add('hidden');
+                    showEmptyState();
                     break;
             }
         });
+
+        // Tell the extension this script is listening. Messages posted before
+        // this point could be lost, so the extension waits for it.
+        vscode.postMessage({ type: 'ready' });
     </script>
 </body>
 </html>

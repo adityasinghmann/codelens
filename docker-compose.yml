@@ -1,28 +1,31 @@
-version: '3.8'
-
 services:
   backend:
     build:
       context: .
       dockerfile: backend.Dockerfile
     ports:
-      - "8000:8000"
+      # Loopback only, like the non-Docker backend: the API has no
+      # authentication and serves your source code.
+      - "127.0.0.1:8000:8000"
     environment:
       - CODELENS_INDEX_PATH=/app/.codelens_index
       - OLLAMA_HOST=http://ollama:11434
       - EMBED_MODEL=nomic-embed-text
-      - CHUNK_SIZE=512
       - TOP_K=10
     volumes:
       - ./backend:/app/backend
       - index_data:/app/.codelens_index
+      # Code to index, mounted read-only. Index it by its container path:
+      #   {"repo_path": "/repos"}  or  {"repo_path": "/repos/<subdir>"}
+      # Defaults to this directory; set CODELENS_REPOS_DIR to point elsewhere.
+      - ${CODELENS_REPOS_DIR:-.}:/repos:ro
     depends_on:
       - ollama
 
   ollama:
     image: ollama/ollama:latest
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     entrypoint: >

@@ -6,6 +6,9 @@
  * so nothing here spawns a process or touches the network.
  */
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 jest.mock('axios');
 jest.mock('../src/pythonEnv', () => {
@@ -29,7 +32,7 @@ jest.mock('../src/toolResolver', () => ({
 
 import axios from 'axios';
 import { spawn } from 'child_process';
-import { BackendController, BackendStatusEvent } from '../src/backendProcess';
+import { BackendController, BackendStatusEvent, migrateLegacyIndex } from '../src/backendProcess';
 import { ensureBackendEnv, BackendSetupError } from '../src/pythonEnv';
 import { recorded, resetRecorded } from './vscodeStub';
 
@@ -118,6 +121,95 @@ describe('BackendController', () => {
 
         expect(controller.getState()).toBe('ready');
         expect(mockedSpawn).not.toHaveBeenCalled();
+        await controller.stop();
+    });
+
+    it('stops at once, with one error, when the process cannot be launched at all', async () => {
+        mockedAxios.get.mockRejectedValue(new Error('ECONNREFUSED'));
+        // What Node really emits for ENOENT: 'error' then 'close', never 'exit'.
+        mockedSpawn.mockImplementation(() => {
+            setImmediate(() => {
+                child.exitCode = -4058;
+                child.emit('error', Object.assign(new Error('spawn /nope/python ENOENT'), { code: 'ENOENT' }));
+                child.emit('close', -4058);
+            });
+            return child;
+        });
+
+        const controller = new BackendController(makeContext());
+        const states: string[] = [];
+        controller.onDidChangeState((e) => states.push(e.state));
+        const started = Date.now();
+
+        const ok = await controller.start();
+
+        expect(ok).toBe(false);
+        expect(Date.now() - started).toBeLessThan(1500); // the timeout is 2s
+        expect(states).toEqual(['starting', 'failed']);
+        expect(recorded.errorMessages).toHaveLength(1);
+        expect(recorded.errorMessages[0]).toMatch(/could not launch/);
+    });
+
+    it('keeps the index in global storage, not the install directory', async () => {
+        let first = true;
+        mockedAxios.get.mockImplementation(async () => {
+            if (first) { first = false; throw new Error('ECONNREFUSED'); }
+            return { data: {} } as any;
+        });
+
+        const controller = new BackendController(makeContext());
+        await controller.start();
+
+        const env = mockedSpawn.mock.calls[0][2].env;
+        expect(env.CODELENS_INDEX_PATH).toBe(path.join('/storage', 'index'));
+        await controller.stop();
+    });
+
+    it('starts its own backend when the adopted one goes away', async () => {
+        let otherWindowUp = true;
+        let oursUp = false;
+        mockedAxios.get.mockImplementation(async () => {
+            if (otherWindowUp || oursUp) { return { data: {} } as any; }
+            throw new Error('ECONNREFUSED');
+        });
+        mockedSpawn.mockImplementation(() => { oursUp = true; return child; });
+
+        const controller = new BackendController(makeContext(), { adoptedProbeMs: 50 });
+        await controller.start();
+        expect(mockedSpawn).not.toHaveBeenCalled();
+
+        otherWindowUp = false; // the window that owned it closed
+        const deadline = Date.now() + 5000;
+        while (controller.getState() !== 'ready' || mockedSpawn.mock.calls.length === 0) {
+            if (Date.now() > deadline) { break; }
+            await new Promise((r) => setTimeout(r, 25));
+        }
+
+        expect(mockedSpawn).toHaveBeenCalledTimes(1);
+        expect(controller.getState()).toBe('ready');
+        expect(recorded.errorMessages).toEqual([]);
+        await controller.stop();
+    }, 10000);
+
+    it("adopts the other window's backend when ours loses the race for the port", async () => {
+        let otherWindowUp = false;
+        mockedAxios.get.mockImplementation(async () => {
+            if (otherWindowUp) { return { data: {} } as any; }
+            throw new Error('ECONNREFUSED');
+        });
+
+        const controller = new BackendController(makeContext());
+        const promise = controller.start();
+        setTimeout(() => {
+            otherWindowUp = true;
+            child.stderr.emit('data', 'ERROR: [Errno 10048] address already in use\n');
+            child.emit('exit', 1, null);
+        }, 120);
+
+        expect(await promise).toBe(true);
+        expect(controller.getState()).toBe('ready');
+        expect(recorded.errorMessages).toEqual([]);
+        await controller.stop();
     });
 
     it('reports a specific error when readiness times out', async () => {
@@ -245,4 +337,44 @@ describe('BackendController', () => {
         expect(child.signals).toEqual(['SIGINT', 'SIGTERM', 'SIGKILL']);
         expect(controller.getState()).toBe('stopped');
     }, 20000);
+});
+
+describe('migrateLegacyIndex', () => {
+    function tempDir() {
+        return fs.mkdtempSync(path.join(os.tmpdir(), 'codelens-migrate-'));
+    }
+
+    it('moves an index out of the install directory once', () => {
+        const root = tempDir();
+        const legacy = path.join(root, 'ext', '.codelens_index');
+        const target = path.join(root, 'storage', 'index');
+        fs.mkdirSync(legacy, { recursive: true });
+        fs.writeFileSync(path.join(legacy, 'codelens.db'), 'data');
+
+        migrateLegacyIndex(legacy, target);
+
+        expect(fs.readFileSync(path.join(target, 'codelens.db'), 'utf-8')).toBe('data');
+        expect(fs.existsSync(legacy)).toBe(false);
+    });
+
+    it('never overwrites an index already in the new location', () => {
+        const root = tempDir();
+        const legacy = path.join(root, 'legacy');
+        const target = path.join(root, 'target');
+        fs.mkdirSync(legacy);
+        fs.writeFileSync(path.join(legacy, 'codelens.db'), 'old');
+        fs.mkdirSync(target);
+        fs.writeFileSync(path.join(target, 'codelens.db'), 'new');
+
+        migrateLegacyIndex(legacy, target);
+
+        expect(fs.readFileSync(path.join(target, 'codelens.db'), 'utf-8')).toBe('new');
+        expect(fs.existsSync(legacy)).toBe(true);
+    });
+
+    it('does nothing when there is no old index', () => {
+        const root = tempDir();
+        migrateLegacyIndex(path.join(root, 'missing'), path.join(root, 'target'));
+        expect(fs.existsSync(path.join(root, 'target'))).toBe(false);
+    });
 });

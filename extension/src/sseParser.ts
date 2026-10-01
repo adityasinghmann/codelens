@@ -12,6 +12,7 @@
  * string-in/events-out class with no I/O so it can be unit tested against
  * arbitrary chunk splits.
  */
+import { StringDecoder } from 'string_decoder';
 
 export interface SseEvent {
     /** The SSE `event:` field, or undefined when the stream omits it. */
@@ -28,13 +29,19 @@ export interface SseParseFailure {
 
 export class SseParser {
     private buffer = '';
+    /**
+     * Streaming UTF-8 decoder for Buffer input. Decoding each Buffer on its
+     * own garbled any multi-byte character split across two chunks; the
+     * decoder holds the incomplete bytes back until the rest arrive.
+     */
+    private readonly decoder = new StringDecoder('utf8');
 
     /**
      * Feed raw bytes/text. Returns every event completed by this chunk.
      * A partial trailing event is retained for the next call.
      */
     public push(chunk: string | Buffer): SseEvent[] {
-        this.buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+        this.buffer += typeof chunk === 'string' ? chunk : this.decoder.write(chunk);
 
         const events: SseEvent[] = [];
         // Normalise CRLF so a \r\n\r\n separator is recognised too.
@@ -59,7 +66,7 @@ export class SseParser {
      * remaining buffer still holds a complete event that must not be dropped.
      */
     public flush(): SseEvent[] {
-        const remainder = this.buffer.trim();
+        const remainder = (this.buffer + this.decoder.end()).trim();
         this.buffer = '';
         if (!remainder) {
             return [];

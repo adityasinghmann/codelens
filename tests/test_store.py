@@ -74,6 +74,15 @@ def test_relative_paths_are_normalised_to_forward_slashes():
     assert normalize_rel_path("src\\pkg\\mod.py") == "src/pkg/mod.py"
 
 
+def test_relative_paths_keep_leading_dots():
+    assert normalize_rel_path(".github/workflows/ci.yml") == ".github/workflows/ci.yml"
+    assert normalize_rel_path(".eslintrc.js") == ".eslintrc.js"
+    assert normalize_rel_path("./src/a.py") == "src/a.py"
+    assert normalize_rel_path("././src/a.py") == "src/a.py"
+    assert normalize_rel_path(".\\.config\\x.toml") == ".config/x.toml"
+    assert normalize_rel_path("/backend/") == "backend/"
+
+
 # --- CRUD -----------------------------------------------------------------
 
 def test_insert_and_read_back(store, tmp_path):
@@ -343,3 +352,16 @@ def test_stored_root_path_keeps_the_users_casing(store, tmp_path):
     assert "RepoName" in stored
     # Identity is still case-insensitive on platforms where that matters.
     assert repo_id_for(str(root).lower()) == repo_id_for(str(root).upper()) or os.name != "nt"
+
+
+def test_registering_an_existing_repository_does_not_touch_it(store, tmp_path):
+    repo_id = store.ensure_repository(str(tmp_path))
+    before = store.get_repository(repo_id)["updated_at"]
+
+    import time
+    time.sleep(0.01)
+    store.ensure_repository(str(tmp_path))
+    assert store.get_repository(repo_id)["updated_at"] == before
+
+    store.touch_repository(repo_id)
+    assert store.get_repository(repo_id)["updated_at"] > before

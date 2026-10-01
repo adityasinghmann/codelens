@@ -29,9 +29,13 @@ def test_class_with_three_methods_yields_one_container_and_three_leaves():
     containers = [c for c in chunks if c["symbol_type"] == "class"]
     methods = [c for c in chunks if c["symbol_type"] == "method"]
 
+    module_code = [c for c in chunks if c["symbol_type"] == "code"]
+
     assert len(containers) == 1
     assert len(methods) == 3
-    assert len(chunks) == 4
+    # The module docstring sits outside every symbol and is its own chunk.
+    assert [c["chunk_text"] for c in module_code] == ['"""Module docstring."""']
+    assert len(chunks) == 5
     assert sorted(m["symbol_name"] for m in methods) == ["__init__", "greet", "shout"]
 
 
@@ -195,3 +199,118 @@ def test_this_repository_parses_without_crashing(path):
     source = (root / path).read_text(encoding="utf-8")
     chunks = extract_chunks(path, source)
     assert len(chunks) > 3
+
+
+# --- Code outside any symbol ----------------------------------------------
+
+def test_inline_route_handlers_are_indexed_alongside_named_functions():
+    """Once a file had one symbol, everything outside symbols was dropped."""
+    src = (
+        'const app = require("express")();\n'
+        "function helper() { return 1; }\n"
+        'app.post("/login", (req, res) => {\n'
+        "  if (!checkPassword(req.body.pw)) { return res.status(401).end(); }\n"
+        "  issueJwtToken(res);\n"
+        "});\n"
+    )
+    chunks = extract_chunks("server.js", src)
+    code = [c for c in chunks if c["symbol_type"] == "code"]
+    assert any("issueJwtToken" in c["chunk_text"] for c in code)
+    assert by_name(chunks)["helper"]["symbol_type"] == "function"
+
+
+def test_module_level_assignments_are_indexed():
+    src = 'DATABASE_URL = "postgres://db/billing"\n\n\ndef get(name):\n    return name\n'
+    code = [c for c in extract_chunks("settings.py", src) if c["symbol_type"] == "code"]
+    assert len(code) == 1
+    assert "DATABASE_URL" in code[0]["chunk_text"]
+    assert (code[0]["start_line"], code[0]["end_line"]) == (1, 1)
+
+
+def test_import_only_blocks_are_not_chunked():
+    src = "import os\nfrom typing import Any\n\n\ndef f():\n    return os.sep\n"
+    assert [c["symbol_type"] for c in extract_chunks("m.py", src)] == ["function"]
+
+
+def test_module_code_never_duplicates_symbol_lines():
+    src = "X = 1\n\ndef f():\n    return X\n\nY = 2\n"
+    chunks = extract_chunks("m.py", src)
+    code_lines = {ln for c in chunks if c["symbol_type"] == "code"
+                  for ln in range(c["start_line"], c["end_line"] + 1)}
+    f = by_name(chunks)["f"]
+    assert code_lines == {1, 6}
+    assert not code_lines & set(range(f["start_line"], f["end_line"] + 1))
+
+
+# --- Decorated and nested classes -----------------------------------------
+
+def test_methods_of_a_decorated_class_are_emitted():
+    """@dataclass made the class a leaf, so its method bodies were lost."""
+    src = (
+        "@dataclass\n"
+        "class Invoice:\n"
+        "    total: int\n"
+        "    def apply_discount(self, pct):\n"
+        "        return compute_tax_rebate(self.total)\n"
+    )
+    chunks = by_name(extract_chunks("m.py", src))
+    assert chunks["Invoice"]["symbol_type"] == "class"
+    method = chunks["apply_discount"]
+    assert method["symbol_type"] == "method"
+    assert method["qualified_name"] == "m.Invoice.apply_discount"
+    assert "compute_tax_rebate" in method["chunk_text"]
+    assert "compute_tax_rebate" not in chunks["Invoice"]["chunk_text"]
+
+
+def test_a_decorated_class_is_emitted_once():
+    src = "@dataclass\nclass Point:\n    x: int\n"
+    classes = [c for c in extract_chunks("m.py", src) if c["symbol_type"] == "class"]
+    assert len(classes) == 1
+
+
+def test_nested_class_bodies_are_not_duplicated_in_the_outer_header():
+    src = (
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        def deep(self):\n"
+        "            return very_specific_body_text()\n"
+        "    def top(self):\n"
+        "        return 1\n"
+    )
+    chunks = extract_chunks("m.py", src)
+    holders = [c["qualified_name"] for c in chunks if "very_specific_body_text" in c["chunk_text"]]
+    assert holders == ["m.Outer.Inner.deep"]
+    assert "class Inner" in by_name(chunks)["Outer"]["chunk_text"]
+
+
+# --- Rust and Go naming ---------------------------------------------------
+
+def test_rust_trait_impl_is_named_after_its_type_not_the_trait():
+    src = (
+        "struct Money(i64);\n"
+        "impl Display for Money {\n"
+        "    fn fmt(&self, f: &mut Formatter) -> Result { Ok(()) }\n"
+        "}\n"
+        "impl<T> Wrapper<T> {\n"
+        "    fn new(v: T) -> Self { Wrapper(v) }\n"
+        "}\n"
+    )
+    names = {c["qualified_name"] for c in extract_chunks("m.rs", src)}
+    assert {"m.Money", "m.Money.fmt", "m.Wrapper", "m.Wrapper.new"} <= names
+    assert not any("Display" in n for n in names)
+
+
+def test_go_types_are_named_and_typed_individually():
+    src = (
+        "package main\n"
+        "type User struct { Name string }\n"
+        "type (\n"
+        "    Store interface { Get(id int) User }\n"
+        "    ID = int\n"
+        ")\n"
+    )
+    chunks = by_name(extract_chunks("m.go", src))
+    assert chunks["User"]["symbol_type"] == "struct"
+    assert chunks["Store"]["symbol_type"] == "interface"
+    assert chunks["ID"]["symbol_type"] == "type"
+    assert "type_declaration" not in chunks

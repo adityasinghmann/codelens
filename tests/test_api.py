@@ -34,7 +34,7 @@ def client(store, fake_embedder, monkeypatch):
         return True, None
 
     monkeypatch.setattr(main_module, "probe_ollama", fake_probe)
-    monkeypatch.setattr(main_module, "global_indexer", None)
+    monkeypatch.setattr(main_module, "_watchers", {})
     monkeypatch.setattr(main_module, "_active_indexing", set())
 
     # Never start a real watchdog from an API-driven index.
@@ -42,7 +42,9 @@ def client(store, fake_embedder, monkeypatch):
     monkeypatch.setattr(Indexer, "start_watchdog", lambda self, *a, **k: None)
     monkeypatch.setattr(Indexer, "stop_watchdog", lambda self, *a, **k: None)
 
-    with TestClient(main_module.app) as test_client:
+    # A loopback Host, like the real client: the default "testserver" is not
+    # an allowed host and is refused (see the DNS-rebinding tests).
+    with TestClient(main_module.app, base_url="http://127.0.0.1:8000") as test_client:
         yield test_client
 
 
@@ -83,6 +85,21 @@ def test_health_reports_both_dependencies(client):
     assert body["ollama"] is True
     assert "index" in body
     assert "vectorai" not in body, "the old field name must be gone"
+
+
+def test_health_reports_a_working_index(client):
+    assert client.get("/health").json()["index"] is True
+
+
+def test_health_reports_an_unusable_index(client, monkeypatch):
+    """The old check passed whenever '.' existed, i.e. always."""
+
+    class BrokenStore:
+        def count_files(self, repo_id=None):
+            raise RuntimeError("database disk image is malformed")
+
+    monkeypatch.setattr(main_module, "get_db", lambda: BrokenStore())
+    assert client.get("/health").json()["index"] is False
 
 
 def test_status_with_nothing_indexed(client):
@@ -177,11 +194,47 @@ def test_index_rejects_an_empty_path(client):
     assert "empty" in response.json()["detail"]
 
 
+def test_a_failed_file_is_not_charged_the_previous_files_chunks(
+    client, make_repo, monkeypatch
+):
+    """A file that fails to parse counts as one failure, whatever came before."""
+    real_chunk_file = main_module.chunk_file
+
+    def flaky_chunk_file(file_path, repo_root, repo_id):
+        if file_path.endswith("broken.py"):
+            raise RuntimeError("unreadable")
+        return real_chunk_file(file_path, repo_root, repo_id)
+
+    monkeypatch.setattr(main_module, "chunk_file", flaky_chunk_file)
+
+    # Whenever a.py (two chunks) is walked first, the old stale-variable bug
+    # charged the failure with a.py's two chunks instead of one.
+    repo = make_repo({"a.py": SAMPLE, "broken.py": SAMPLE})
+    done = sse_events(client.post("/index", json={"repo_path": repo}))[-1]
+
+    assert done["type"] == "complete"
+    assert done["stored"] == 2
+    assert done["failed"] == 1
+
+
+def test_every_indexed_repository_gets_its_own_watcher(client, make_repo):
+    """A multi-root workspace indexes several folders; all must stay live."""
+    from backend.db_client import repo_id_for
+
+    repo_a = make_repo({"a.py": SAMPLE}, name="a")
+    repo_b = make_repo({"b.py": SAMPLE}, name="b")
+    client.post("/index", json={"repo_path": repo_a})
+    client.post("/index", json={"repo_path": repo_b})
+    client.post("/index", json={"repo_path": repo_a})  # re-index keeps one watcher
+
+    assert set(main_module._watchers) == {repo_id_for(repo_a), repo_id_for(repo_b)}
+
+
 def test_concurrent_index_of_the_same_repository_returns_409(
     client, make_repo, fake_embedder, monkeypatch
 ):
     """
-    Two overlapping runs used to race on the module-level global_indexer.
+    Two overlapping runs used to race on a module-level indexer global.
     The second must be refused, not interleaved.
     """
     import asyncio
@@ -270,6 +323,26 @@ def test_query_enforces_the_top_k_range(client, make_repo):
     assert client.post("/query", json={"query": "x", "top_k": 99, "repo_path": repo}).status_code == 422
 
 
+def test_query_without_top_k_uses_the_top_k_setting(
+    client, make_repo, stub_query_embedding, monkeypatch
+):
+    from backend.config import Settings
+
+    repo = make_repo({"m.py": SAMPLE})
+    client.post("/index", json={"repo_path": repo})
+    stub_query_embedding("anything")
+
+    monkeypatch.setattr(Settings, "TOP_K", 1)
+    assert len(client.post("/query", json={"query": "x", "repo_path": repo}).json()["results"]) == 1
+
+    monkeypatch.setattr(Settings, "TOP_K", 500)  # clamped to 20, not rejected
+    assert client.post("/query", json={"query": "x", "repo_path": repo}).status_code == 200
+
+    # An explicit top_k still wins.
+    body = client.post("/query", json={"query": "x", "top_k": 2, "repo_path": repo}).json()
+    assert len(body["results"]) == 2
+
+
 def test_query_isolates_repositories(client, make_repo, stub_query_embedding):
     repo_a = make_repo({"a.py": "def only_alpha():\n    return 1\n"}, name="a")
     repo_b = make_repo({"b.py": "def only_beta():\n    return 2\n"}, name="b")
@@ -311,3 +384,60 @@ def test_cors_does_not_allow_an_arbitrary_web_origin(client):
 
 def test_requests_without_an_origin_still_work(client):
     assert client.get("/health").status_code == 200
+
+
+# --- DNS rebinding --------------------------------------------------------
+
+def test_a_foreign_host_header_is_refused(client):
+    """A rebinding page reaches 127.0.0.1 under its own name; refuse it."""
+    response = client.get("/health", headers={"Host": "attacker.example:8000"})
+    assert response.status_code == 400
+
+
+def test_a_foreign_host_cannot_read_indexed_code(client, make_repo, stub_query_embedding):
+    repo = make_repo({"m.py": SAMPLE})
+    client.post("/index", json={"repo_path": repo})
+    stub_query_embedding("anything")
+    response = client.post("/query", json={"query": "x", "repo_path": repo},
+                           headers={"Host": "attacker.example"})
+    assert response.status_code == 400
+    assert "alpha_one" not in response.text
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:8000", "localhost:8000", "127.0.0.1", "localhost"])
+def test_loopback_host_headers_are_served(client, host):
+    assert client.get("/health", headers={"Host": host}).status_code == 200
+
+
+# --- incremental index and last_indexed -----------------------------------
+
+def test_incremental_index_prunes_files_deleted_from_disk(client, make_repo, store):
+    import os
+    from backend.db_client import repo_id_for
+
+    repo = make_repo({"a.py": SAMPLE, "gone.py": "def gone():\n    return 1\n"})
+    client.post("/index", json={"repo_path": repo})
+    os.remove(os.path.join(repo, "gone.py"))
+
+    done = sse_events(client.post("/index", json={"repo_path": repo}))[-1]
+
+    assert done["removed_files"] == 1
+    assert [f["path"] for f in store.list_files(repo_id_for(repo))] == ["a.py"]
+
+
+def test_last_indexed_does_not_move_when_nothing_is_indexed(client, make_repo):
+    """Restoring the watcher at startup used to count as an index run."""
+    from backend.indexer import Indexer
+
+    repo = make_repo({"m.py": SAMPLE})
+    client.post("/index", json={"repo_path": repo})
+    before = client.get("/status").json()["last_indexed"]
+
+    time.sleep(0.01)
+    Indexer(repo)  # what lifespan does on every backend start
+
+    assert client.get("/status").json()["last_indexed"] == before
+
+    time.sleep(0.01)
+    client.post("/index", json={"repo_path": repo})
+    assert client.get("/status").json()["last_indexed"] > before

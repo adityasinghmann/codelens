@@ -185,3 +185,68 @@ async def test_explain_model_comes_from_config():
     assert Settings.EXPLAIN_MODEL
     assert hasattr(Settings, "EMBED_MODEL")
     assert hasattr(Settings, "OLLAMA_HOST")
+
+
+# --- Real HTTP across event loops -----------------------------------------
+
+@pytest.fixture
+def local_ollama(monkeypatch):
+    """
+    A real keep-alive HTTP server imitating Ollama's embeddings endpoint.
+
+    The event-loop bug lives in the real HTTP client's connection pool, so it
+    cannot be reproduced by monkeypatching _embed_text like the rest of this
+    suite does.
+    """
+    import socket
+    import threading
+    import time
+    import uvicorn
+    from fastapi import FastAPI
+
+    fake = FastAPI()
+
+    @fake.post("/api/embeddings")
+    async def embeddings(body: dict):
+        return {"embedding": [0.5] * FAKE_DIM}
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    server = uvicorn.Server(uvicorn.Config(fake, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not server.started and time.time() < deadline:
+        time.sleep(0.02)
+    assert server.started, "fake Ollama did not start"
+
+    monkeypatch.setattr(Settings, "OLLAMA_HOST", f"http://127.0.0.1:{port}")
+    yield
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_embedding_works_on_a_new_loop_after_the_first_is_closed(store, make_repo, local_ollama):
+    """
+    POST /index embeds on a private loop and closes it; the watcher then
+    embeds on its own loop with the same Indexer. Sharing one HTTP client
+    across them failed with "Event loop is closed".
+    """
+    import asyncio
+
+    indexer = Indexer(make_repo({"a.py": "x = 1\n"}))
+
+    first = asyncio.new_event_loop()
+    try:
+        assert first.run_until_complete(indexer._embed_text("first")) is not None
+    finally:
+        first.close()
+
+    second = asyncio.new_event_loop()
+    try:
+        assert second.run_until_complete(indexer._embed_text("second")) is not None
+    finally:
+        second.close()

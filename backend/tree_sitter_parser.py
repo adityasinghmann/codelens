@@ -16,6 +16,10 @@ That split is what stops a class being emitted once as a chunk containing all
 its methods and then again as one chunk per method - the same code embedded
 twice, competing with itself in the results.
 
+Code that no symbol covers (module-level statements, handlers passed inline
+to a call) is emitted as "code" chunks, so nothing in a file goes unindexed
+just because the file also contains a function.
+
 Traversal is iterative and holds a reference to every node it visits. That is
 not a style preference: the previous recursive walk dropped references to
 intermediate Node objects, and tree-sitter's Python binding frees the
@@ -24,6 +28,7 @@ reproducibly segfaulted the backend on files in this repository.
 """
 
 import os
+import re
 import logging
 from typing import Optional
 
@@ -80,7 +85,9 @@ LEAF_NODE_TYPES: dict[str, set[str]] = {
     "tsx":        {"function_declaration", "method_definition", "arrow_function",
                    "type_alias_declaration"},
     "javascript": {"function_declaration", "method_definition", "arrow_function"},
-    "go":         {"function_declaration", "method_declaration"},
+    # Go types are units of their own: one chunk per type_spec, so a grouped
+    # `type ( A struct{}; B int )` yields A and B, each under its real name.
+    "go":         {"function_declaration", "method_declaration", "type_spec", "type_alias"},
     "rust":       {"function_item"},
     "java":       {"method_declaration", "constructor_declaration"},
     "cpp":        {"function_definition"},
@@ -92,7 +99,7 @@ CONTAINER_NODE_TYPES: dict[str, set[str]] = {
     "typescript": {"class_declaration", "interface_declaration"},
     "tsx":        {"class_declaration", "interface_declaration"},
     "javascript": {"class_declaration"},
-    "go":         {"type_declaration"},
+    "go":         set(),
     "rust":       {"impl_item", "struct_item", "mod_item", "trait_item"},
     "java":       {"class_declaration", "interface_declaration", "enum_declaration"},
     "cpp":        {"class_specifier", "struct_specifier"},
@@ -115,7 +122,8 @@ _SYMBOL_TYPES: dict[str, str] = {
     "interface_declaration": "interface",
     "trait_item": "interface",
     "type_alias_declaration": "type",
-    "type_declaration": "type",
+    "type_spec": "type",
+    "type_alias": "type",
     "struct_item": "struct",
     "struct_specifier": "struct",
     "impl_item": "impl",
@@ -145,6 +153,22 @@ def _get_symbol_name(node, source_bytes: bytes) -> str:
         for child in node.children:
             if child.type in {"function_definition", "class_definition"}:
                 return _get_symbol_name(child, source_bytes)
+
+    # Rust `impl Display for Money` belongs to Money, not to Display: name it
+    # by its `type` field. The generic identifier scan below would find the
+    # trait first. Generic arguments are dropped, so `impl<T> Wrapper<T>` is
+    # scoped as Wrapper.
+    if node.type == "impl_item":
+        try:
+            type_node = node.child_by_field_name("type")
+            if type_node is not None and type_node.type == "generic_type":
+                base = type_node.child_by_field_name("type")
+                if base is not None:
+                    type_node = base
+        except Exception:
+            type_node = None
+        if type_node is not None:
+            return _node_text(source_bytes, type_node)
 
     # A `name:` field is the most reliable source when the grammar has one.
     try:
@@ -189,6 +213,15 @@ def _effective_node(node):
 def _symbol_type_for(node, parent_symbol: Optional[str]) -> str:
     inner = _effective_node(node)
     symbol_type = _SYMBOL_TYPES.get(inner.type, inner.type)
+    # A Go type_spec says what it declares through its `type` field.
+    if inner.type == "type_spec":
+        try:
+            declared = inner.child_by_field_name("type")
+        except Exception:
+            declared = None
+        if declared is not None:
+            symbol_type = {"struct_type": "struct",
+                           "interface_type": "interface"}.get(declared.type, symbol_type)
     # A function declared inside a class is a method, whatever the grammar
     # happens to call the node.
     if symbol_type == "function" and parent_symbol:
@@ -196,21 +229,22 @@ def _symbol_type_for(node, parent_symbol: Optional[str]) -> str:
     return symbol_type
 
 
-def _container_header(node, source_bytes: bytes, leaf_types: set[str]) -> str:
+def _container_header(node, source_bytes: bytes, emitted_types: set[str]) -> str:
     """
     Header-only text for a container: the declaration line, its docstring and
-    its field declarations, with nested leaf bodies removed.
+    its field declarations, with the bodies of nested symbols removed.
 
     Keeping the signature and docstring preserves what makes the class findable
-    semantically; dropping the method bodies is what stops the container chunk
-    duplicating every leaf chunk beneath it.
+    semantically; dropping the bodies of everything emitted as its own chunk -
+    methods, and nested classes too - is what stops the container chunk
+    duplicating the chunks beneath it.
     """
     inner = _effective_node(node)
     pieces: list[str] = []
     cursor = inner.start_byte
 
     def is_leaf(n) -> bool:
-        return _effective_node(n).type in leaf_types or n.type in leaf_types
+        return _effective_node(n).type in emitted_types
 
     # Walk the class body one level deep, skipping the bodies of nested leaves.
     body = None
@@ -292,9 +326,14 @@ def extract_chunks(file_path: str, content: str) -> list[dict]:
                 continue
             visited.add(key)
 
+            # Classify by what a decorator wraps, not by the wrapper: a
+            # decorated class is a container. Classifying the wrapper made
+            # `@dataclass class X` a leaf, so its methods were never visited
+            # and their bodies were indexed nowhere.
             inner = _effective_node(node)
-            is_leaf = node.type in leaf_types or inner.type in leaf_types
-            is_container = node.type in container_types or inner.type in container_types
+            alive.append(inner)
+            is_leaf = inner.type in leaf_types
+            is_container = inner.type in container_types
 
             # An arrow function only counts when bound to a variable, otherwise
             # every inline callback becomes a chunk.
@@ -310,7 +349,7 @@ def extract_chunks(file_path: str, content: str) -> list[dict]:
                 )
 
                 if is_container:
-                    chunk_text = _container_header(node, source_bytes, leaf_types)
+                    chunk_text = _container_header(node, source_bytes, leaf_types | container_types)
                 else:
                     chunk_text = _node_text(source_bytes, node)
 
@@ -331,8 +370,10 @@ def extract_chunks(file_path: str, content: str) -> list[dict]:
                     continue
 
                 # Container: descend, and nested symbols are qualified by it.
+                # Descend from the unwrapped node, so a decorated class is not
+                # visited a second time through its own class_definition.
                 child_scope = ".".join(p for p in (parent_symbol, symbol_name) if p)
-                for child in reversed(list(node.children)):
+                for child in reversed(list(inner.children)):
                     stack.append((child, child_scope))
                 continue
 
@@ -345,8 +386,90 @@ def extract_chunks(file_path: str, content: str) -> list[dict]:
     if not chunks and content.strip():
         return _sliding_window(file_path, content, lang_name)
 
+    chunks.extend(_module_level_chunks(file_path, content, chunks, lang_name, module_name))
     chunks.sort(key=lambda c: (c["start_line"], c["end_line"]))
     return chunks
+
+
+# A line that carries no meaning of its own: imports, package/use lines and
+# bare closing brackets. A block made only of these is not worth embedding.
+_BOILERPLATE_LINE = re.compile(
+    r"^\s*(?:"
+    r"import\b|from\s+[\w.]+\s+import\b|package\s|use\s|#include\b|using\s|"
+    r"(?:const|let|var)\s+[^=]+=\s*require\(|"
+    r"(?:type|var|const|import)\s*\(\s*$|"   # Go group openers: `type (`
+    r"[\])},;]*\s*$"
+    r")"
+)
+
+
+def _module_level_chunks(file_path: str, content: str, chunks: list[dict],
+                         lang_name: str, module_name: str,
+                         window: int = 40, overlap: int = 10) -> list[dict]:
+    """
+    Chunks for code that no symbol covers.
+
+    Symbol extraction alone drops everything outside a recognised function or
+    class once a file has at least one: an Express handler passed inline to
+    app.post(), a module-level config dict, a Go var block. That is often
+    exactly what a question is about, so each contiguous run of uncovered lines
+    becomes a "code" chunk (windowed if long). Runs of pure imports or closing
+    brackets are skipped.
+    """
+    lines = content.splitlines()
+    covered = [False] * (len(lines) + 2)
+    for chunk in chunks:
+        for line_no in range(chunk["start_line"], min(chunk["end_line"], len(lines)) + 1):
+            covered[line_no] = True
+
+    runs: list[tuple[int, int]] = []  # 1-based inclusive line ranges
+    start = None
+    for line_no in range(1, len(lines) + 1):
+        if not covered[line_no]:
+            if start is None:
+                start = line_no
+        elif start is not None:
+            runs.append((start, line_no - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(lines)))
+
+    blocks: list[dict] = []
+    step = max(1, window - overlap)
+    for run_start, run_end in runs:
+        # Trim blank lines at either end of the run.
+        while run_start <= run_end and not lines[run_start - 1].strip():
+            run_start += 1
+        while run_end >= run_start and not lines[run_end - 1].strip():
+            run_end -= 1
+        if run_start > run_end:
+            continue
+
+        significant = [ln for ln in lines[run_start - 1:run_end] if ln.strip()]
+        if all(_BOILERPLATE_LINE.match(ln) for ln in significant):
+            continue
+
+        for offset in range(0, run_end - run_start + 1, step):
+            first = run_start + offset
+            last = min(first + window - 1, run_end)
+            text = "\n".join(lines[first - 1:last]).strip()
+            if text:
+                blocks.append({
+                    "file_path":      file_path,
+                    "start_line":     first,
+                    "end_line":       last,
+                    # Identity is (type, qualified name) plus an occurrence
+                    # ordinal assigned in source order - not line numbers.
+                    "symbol_name":    "<module>",
+                    "qualified_name": f"{module_name}.<module>" if module_name else "<module>",
+                    "symbol_type":    "code",
+                    "parent_symbol":  None,
+                    "language":       lang_name,
+                    "chunk_text":     text,
+                })
+            if last == run_end:
+                break
+    return blocks
 
 
 def _sliding_window(file_path: str, content: str, lang_name: str,

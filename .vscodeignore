@@ -30,6 +30,8 @@ node_modules/.bin/**
 setup.sh
 start.sh
 docker-compose.yml
+backend.Dockerfile
+.dockerignore
 .env
 .env.example
 .gitignore

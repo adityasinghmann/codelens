@@ -100,7 +100,25 @@ class Indexer:
         self.repo_id = self.db.ensure_repository(repo_path)
         self.observer: Optional[Observer] = None
         self.worker: Optional["_IndexWorker"] = None
-        self.ollama_client = AsyncClient(host=Settings.OLLAMA_HOST)
+        # Created lazily, one per event loop: see _client().
+        self.ollama_client: Optional[AsyncClient] = None
+        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _client(self) -> AsyncClient:
+        """
+        The Ollama client for the running event loop.
+
+        An async HTTP client's pooled connections belong to the loop that
+        opened them. This Indexer is used first on POST /index's private loop,
+        which is then closed, and afterwards on the watcher's own loop; reusing
+        one client across them failed the first watcher embed with "Event loop
+        is closed", silently dropping that edit's chunks.
+        """
+        loop = asyncio.get_running_loop()
+        if self.ollama_client is None or self._client_loop is not loop:
+            self.ollama_client = AsyncClient(host=Settings.OLLAMA_HOST)
+            self._client_loop = loop
+        return self.ollama_client
 
     def walk_repo(self) -> Generator[str, None, None]:
         for root, dirs, files in os.walk(self.repo_path):
@@ -122,7 +140,7 @@ class Indexer:
         hardcoded regardless of the model's actual width.
         """
         try:
-            resp = await self.ollama_client.embeddings(
+            resp = await self._client().embeddings(
                 model=Settings.EMBED_MODEL,
                 prompt=f"search_document: {text}"
             )
@@ -284,6 +302,12 @@ class Indexer:
         return await self.index_file(parsed)
 
     async def reindex_file_async(self, file_path: str) -> Dict[str, int]:
+        if not os.path.isfile(file_path):
+            # Gone before the debounce fired (a create or modify followed by a
+            # delete). Indexing it would record a row for a file that does not
+            # exist; it is a removal.
+            self.remove_file(file_path)
+            return {"stored": 0, "skipped": 0, "deleted": 0, "failed": 0}
         parsed = chunk_file(file_path, self.repo_path, self.repo_id)
         result = await self.index_file(parsed)
         logger.info(
@@ -299,6 +323,19 @@ class Indexer:
         rel = normalize_rel_path(os.path.relpath(file_path, self.repo_path))
         self.db.delete_file(self.repo_id, rel)
         logger.info("Removed <%s> from repo %s", rel, self.repo_id[:8])
+
+    def prune_missing(self, present: set) -> int:
+        """
+        Drop stored files that are not in `present` (repository-relative
+        paths from this walk). Without this, an incremental index kept files
+        deleted while the backend was not watching searchable forever.
+        """
+        stale = [f["path"] for f in self.db.list_files(self.repo_id) if f["path"] not in present]
+        for rel in stale:
+            self.db.delete_file(self.repo_id, rel)
+        if stale:
+            logger.info("Pruned %d file(s) no longer on disk from repo %s", len(stale), self.repo_id[:8])
+        return len(stale)
 
     def start_watchdog(self, debounce_seconds: float = 0.5):
         if self.observer is not None:
@@ -442,11 +479,23 @@ class RepoEventHandler(FileSystemEventHandler):
         self.worker = worker
 
     def _is_indexable(self, src_path: str) -> bool:
+        # The same set walk_repo() uses, so a file the full index picked up
+        # (.md, .toml, .yaml, ...) is also kept current by the watcher.
         ext = os.path.splitext(src_path)[1].lower()
-        if ext not in LANGUAGES:
+        if ext not in SUPPORTED_EXTENSIONS:
             return False
-        parts = os.path.normpath(src_path).split(os.sep)
-        return not any(ign in parts for ign in IGNORE_DIRS)
+        # Match ignored directory names only INSIDE the repository, as
+        # walk_repo() does. Checking the whole absolute path disabled the
+        # watcher for any repository that merely lives under a directory
+        # called build, dist, out, vendor or venv.
+        try:
+            rel = os.path.relpath(os.path.abspath(src_path), os.path.abspath(self.indexer.repo_path))
+        except ValueError:  # different drive on Windows
+            return False
+        dirs = os.path.normpath(rel).split(os.sep)[:-1]
+        if dirs and dirs[0] == os.pardir:
+            return False
+        return not any(part in IGNORE_DIRS for part in dirs)
 
     def _in_repo(self, path: str) -> bool:
         """Guard against events for paths outside this indexer's repository."""

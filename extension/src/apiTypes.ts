@@ -23,8 +23,11 @@ export interface IndexRequest {
 /** POST /query request body. */
 export interface QueryRequest {
     query: string;
-    /** 1..20 inclusive; the backend rejects anything outside that range. */
-    top_k: number;
+    /**
+     * 1..20 inclusive; the backend rejects anything outside that range.
+     * Omitted, the backend's TOP_K setting decides.
+     */
+    top_k?: number;
     explain: boolean;
     /**
      * Repository to search. Results are always scoped to exactly one
@@ -111,6 +114,8 @@ export interface IndexCompleteEvent {
     skipped: number;
     /** Chunks that could not be embedded or stored. */
     failed: number;
+    /** Stored files no longer on disk, removed by this run. */
+    removed_files: number;
     duration_ms: number;
 }
 

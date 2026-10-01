@@ -193,3 +193,10 @@ def test_hydration_only_reads_the_winners(store, tmp_path, monkeypatch):
     import re
     inside = re.search(r"IN \((.*?)\)", hydration[0], re.S).group(1)
     assert len(inside.split(",")) == 5, hydration[0]
+
+
+def test_path_prefix_is_case_sensitive(store, populated):
+    """SQLite LIKE ignores ASCII case; "Backend/" is a different directory."""
+    assert store.search(fake_vector("x"), repo_id=populated, top_k=20, path_prefix="Backend/") == []
+    assert paths(store.search(fake_vector("x"), repo_id=populated, top_k=20, path_prefix="frontend/ui")) == [
+        "frontend/ui.ts", "frontend/ui.ts"]

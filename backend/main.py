@@ -12,6 +12,7 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -19,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from backend.config import Settings
-from backend.db_client import get_db, repo_id_for, normalize_root
+from backend.db_client import get_db, repo_id_for, normalize_rel_path
 from backend.indexer import Indexer, chunk_file
 from backend.query import run_query, EmbeddingModelMismatch
 
@@ -27,7 +28,12 @@ logger = logging.getLogger(__name__)
 
 # The last_repo.json sidecar is gone: the repositories table is the record of
 # what has been indexed, and unlike the sidecar it can hold more than one.
-global_indexer: Indexer | None = None
+#
+# One live watcher per repository indexed during this process, keyed by
+# repo_id. A multi-root workspace indexes several folders, and every one of
+# them must stay current - not just whichever was indexed last.
+_watchers: dict[str, Indexer] = {}
+_watchers_lock = threading.Lock()
 
 # repo_ids with an index run in flight. Two overlapping POST /index calls for
 # the same repository previously raced on global_indexer and on each other's
@@ -80,10 +86,25 @@ def validate_repo_path(raw: str) -> str:
     return resolved
 
 
+def watch_repository(indexer: Indexer) -> None:
+    """Start a live watcher for this indexer's repository, unless one runs."""
+    with _watchers_lock:
+        if indexer.repo_id in _watchers:
+            return
+        _watchers[indexer.repo_id] = indexer
+    indexer.start_watchdog()
+
+
+def stop_all_watchers() -> None:
+    with _watchers_lock:
+        indexers = list(_watchers.values())
+        _watchers.clear()
+    for indexer in indexers:
+        indexer.stop_watchdog()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global global_indexer
-    
     # Init DB explicitly to load resources safely
     db = get_db()
     
@@ -104,14 +125,12 @@ async def lifespan(app: FastAPI):
     recent = db.most_recent_repository()
     if recent and os.path.isdir(recent["root_path"]):
         logger.info("Restoring live file watcher for: %s", recent["root_path"])
-        global_indexer = Indexer(recent["root_path"])
-        global_indexer.start_watchdog()
+        watch_repository(Indexer(recent["root_path"]))
 
     yield
-    
-    # Teardown: stop the watcher and its background index loop.
-    if global_indexer is not None:
-        global_indexer.stop_watchdog()
+
+    # Teardown: stop every watcher and its background index loop.
+    stop_all_watchers()
 
 app = FastAPI(title="CodeLens Offline Core", lifespan=lifespan)
 
@@ -128,6 +147,12 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+# CORS alone does not stop DNS rebinding: a page on attacker.example that
+# re-resolves its own name to 127.0.0.1 is same-origin with this server from
+# the browser's point of view, so no CORS check ever runs. Its requests still
+# carry "Host: attacker.example", so only loopback Host values are served.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=Settings.ALLOWED_HOSTS)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -161,7 +186,8 @@ class IndexRequest(BaseModel):
 class QueryRequest(BaseModel):
     """Body of POST /query."""
     query: str
-    top_k: int = Field(8, ge=1, le=20)
+    # 1..20. When omitted, the TOP_K setting decides (clamped to that range).
+    top_k: int | None = Field(None, ge=1, le=20)
     explain: bool = False
     # Which repository to search. Results are always scoped to exactly one
     # repository; when omitted the most recently indexed one is used.
@@ -246,6 +272,9 @@ def indexer_worker(repo_path: str, repo_id: str, force: bool,
 
         for file_path in files:
             rel = os.path.relpath(file_path, repo_path)
+            # Reset per file: a failure must never be charged with the chunk
+            # count of the previous file.
+            parsed = None
             try:
                 parsed = chunk_file(file_path, repo_path, indexer.repo_id)
                 rel = parsed.rel_path
@@ -257,7 +286,7 @@ def indexer_worker(repo_path: str, repo_id: str, force: bool,
             except Exception as err:
                 # A file that could not be parsed or stored at all counts as a
                 # failure of every chunk it would have produced.
-                failed += max(1, len(parsed.chunks) if "parsed" in dir() else 1)
+                failed += max(1, len(parsed.chunks)) if parsed is not None else 1
                 send({"type": "error", "message": str(err), "file": rel})
             finally:
                 # Count the file as processed even when it failed, so the
@@ -274,6 +303,12 @@ def indexer_worker(repo_path: str, repo_id: str, force: bool,
 
         local_loop.close()
 
+        # Files deleted while nothing was watching are still stored; drop
+        # everything this walk did not find. (A forced run starts empty.)
+        removed_files = indexer.prune_missing(
+            {normalize_rel_path(os.path.relpath(f, repo_path)) for f in files}
+        )
+
         db.set_index_metadata(indexer.repo_id, status="ready")
         db.touch_repository(indexer.repo_id)
 
@@ -289,14 +324,14 @@ def indexer_worker(repo_path: str, repo_id: str, force: bool,
             "stored": stored,
             "skipped": skipped,
             "failed": failed,
+            "removed_files": removed_files,
             "duration_ms": duration,
         })
 
-        global global_indexer
-        if global_indexer is not None and global_indexer.repo_id != indexer.repo_id:
-            global_indexer.stop_watchdog()
-        global_indexer = indexer
-        global_indexer.start_watchdog()
+        # Keep this repository live alongside any others already watched. A
+        # re-index of an already-watched repository keeps its existing watcher
+        # rather than starting a second one on the same tree.
+        watch_repository(indexer)
 
     except Exception as e:
         logger.exception("Indexing failed for %s", repo_path)
@@ -305,6 +340,11 @@ def indexer_worker(repo_path: str, repo_id: str, force: bool,
         with _active_lock:
             _active_indexing.discard(repo_id)
         send(None)
+
+
+def default_top_k() -> int:
+    """TOP_K from the environment, held to the range the API accepts."""
+    return max(1, min(20, Settings.TOP_K))
 
 
 def resolve_repo_id(repo_path: str | None) -> str:
@@ -383,7 +423,7 @@ async def api_query(req: QueryRequest):
         data = await run_query(
             req.query,
             repo_id=repo_id,
-            top_k=req.top_k,
+            top_k=req.top_k if req.top_k is not None else default_top_k(),
             explain=req.explain,
             language=req.language,
             path_prefix=req.path_prefix,
@@ -415,12 +455,11 @@ async def api_query(req: QueryRequest):
 async def api_status():
     db = get_db()
 
-    # Report on the repository the watcher is attached to, falling back to the
-    # most recently indexed one.
-    if global_indexer is not None:
-        repo = db.get_repository(global_indexer.repo_id)
-    else:
-        repo = db.most_recent_repository()
+    # Report on the most recently indexed repository; `watching` says whether
+    # that repository has a live watcher.
+    repo = db.most_recent_repository()
+    with _watchers_lock:
+        watcher = _watchers.get(repo["repo_id"]) if repo else None
 
     return {
         "indexed_chunks": db.count(repo["repo_id"]) if repo else 0,
@@ -428,7 +467,7 @@ async def api_status():
         "repo_path": repo["root_path"] if repo else None,
         "db_path": Settings.INDEX_PATH,
         "embed_model": Settings.EMBED_MODEL,
-        "watching": global_indexer is not None and global_indexer.observer is not None,
+        "watching": watcher is not None and watcher.observer is not None,
     }
 
 
@@ -436,11 +475,16 @@ async def api_status():
 async def api_health():
     ollama_ok, ollama_err = await probe_ollama(timeout=1.5)
 
-    db_ok = False
-    db_dir = os.path.dirname(Settings.INDEX_PATH)
-    if os.path.exists(Settings.INDEX_PATH) or (db_dir and os.path.exists(db_dir)):
+    # Actually query the index. The previous check accepted the index path's
+    # parent directory, which for the default "./.codelens_index" is "." and
+    # always exists, so it reported true even with no usable database.
+    try:
+        get_db().count_files()
         db_ok = True
-        
+    except Exception as e:
+        logger.warning("Index health check failed: %s", e)
+        db_ok = False
+
     return {
         "ollama": ollama_ok,
         "index": db_ok,

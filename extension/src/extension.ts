@@ -20,7 +20,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const provider = new SearchPanelProvider(context.extensionUri);
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('codelens.sidebar', provider)
+        // Keep the sidebar alive while collapsed, so a long re-index keeps its
+        // progress and messages instead of being reset when the view is hidden.
+        vscode.window.registerWebviewViewProvider('codelens.sidebar', provider, {
+            webviewOptions: { retainContextWhenHidden: true },
+        })
     );
 
     context.subscriptions.push(vscode.commands.registerCommand('codelens.search', () => {

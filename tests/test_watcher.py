@@ -129,6 +129,15 @@ def test_files_in_ignored_directories_are_not_indexed(store, watched):
     assert "junk" not in symbols_in(store, indexer.repo_id)
 
 
+def test_non_code_files_the_walker_indexes_are_watched_too(store, watched):
+    """walk_repo() indexes .md/.toml/.yaml; the watcher must keep them current."""
+    repo, indexer = watched
+    write(repo, "NOTES.md", "# Deployment notes\n\nRotate the signing key monthly.\n")
+    settle(indexer)
+
+    assert "NOTES.md" in files_in(store, indexer.repo_id)
+
+
 def test_non_source_files_are_ignored_by_the_watcher(store, watched, embed_calls):
     repo, indexer = watched
     embed_calls.clear()
@@ -148,3 +157,34 @@ def test_stop_watchdog_tears_everything_down(store, make_repo, fake_embedder):
     indexer.stop_watchdog()
     assert indexer.observer is None
     assert indexer.worker is None
+
+
+def test_watcher_works_for_a_repo_inside_a_directory_named_build(store, make_repo, fake_embedder):
+    """Ignored names used to be matched against the whole absolute path."""
+    repo = make_repo({"seed.py": "def seed():\n    return 1\n"}, name="build/myproject")
+    indexer = Indexer(repo)
+    indexer.start_watchdog(debounce_seconds=DEBOUNCE)
+    try:
+        write(repo, "new_file.py", "def brand_new():\n    return 42\n")
+        settle(indexer)
+        assert "new_file.py" in files_in(store, indexer.repo_id)
+    finally:
+        indexer.stop_watchdog()
+
+
+def test_ignored_directories_inside_the_repo_are_still_ignored(store, make_repo, fake_embedder):
+    from backend.indexer import RepoEventHandler
+
+    repo = make_repo({"seed.py": "x = 1\n"}, name="plain")
+    handler = RepoEventHandler(Indexer(repo), worker=None)
+    assert handler._is_indexable(os.path.join(repo, "src", "a.py"))
+    assert not handler._is_indexable(os.path.join(repo, "build", "a.py"))
+    assert not handler._is_indexable(os.path.join(repo, "src", "node_modules", "a.py"))
+    assert not handler._is_indexable(os.path.join(os.path.dirname(repo), "elsewhere.py"))
+
+
+def test_a_file_gone_before_the_debounce_fires_leaves_no_row(store, make_repo, fake_embedder):
+    repo = make_repo({"seed.py": "def seed():\n    return 1\n"})
+    indexer = Indexer(repo)
+    indexer.reindex_file(os.path.join(repo, "never_existed.py"))
+    assert "never_existed.py" not in files_in(store, indexer.repo_id)

@@ -52,6 +52,15 @@ describe('resolveInsideRoot', () => {
         expect(resolveInsideRoot(`${ROOT}${path.sep}.`, 'src/a.py')).not.toBeNull();
     });
 
+    it('accepts a file whose name merely starts with two dots', () => {
+        expect(resolveInsideRoot(ROOT, '..notes.md')).toBe(path.join(ROOT, '..notes.md'));
+        expect(resolveInsideRoot(ROOT, 'docs/..hidden/x.md')).not.toBeNull();
+    });
+
+    it('still rejects a bare parent reference', () => {
+        expect(resolveInsideRoot(ROOT, '..')).toBeNull();
+    });
+
     if (isWindows) {
         it('rejects a path on another drive', () => {
             expect(resolveInsideRoot(ROOT, 'E:\\elsewhere\\x.py')).toBeNull();

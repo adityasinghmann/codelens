@@ -140,3 +140,25 @@ describe('SseParser', () => {
         expect(events).toHaveLength(1);
     });
 });
+
+describe('SseParser with raw bytes', () => {
+    it('keeps a multi-byte character intact when it is split across chunks', () => {
+        const bytes = Buffer.from('data: {"file":"café.py"}\n\n', 'utf-8');
+        const cut = bytes.indexOf(0xc3) + 1; // inside the two-byte "é"
+        const parser = new SseParser();
+
+        const events = [...parser.push(bytes.subarray(0, cut)), ...parser.push(bytes.subarray(cut))];
+
+        expect(events.map((e) => e.data)).toEqual(['{"file":"café.py"}']);
+    });
+
+    it('decodes byte-by-byte delivery correctly', () => {
+        const bytes = Buffer.from('data: ✓ 日本\n\n', 'utf-8');
+        const parser = new SseParser();
+        const events: SseEvent[] = [];
+        for (let i = 0; i < bytes.length; i++) {
+            events.push(...parser.push(bytes.subarray(i, i + 1)));
+        }
+        expect(events.map((e) => e.data)).toEqual(['✓ 日本']);
+    });
+});

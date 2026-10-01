@@ -1,0 +1,18 @@
+# The image needs only requirements.txt and backend/. Keep the build context
+# small and free of local state.
+.git
+.github
+.venv
+venv
+node_modules
+dist
+out
+extension
+media
+tests
+.codelens_index
+.vectorai_db
+.pytest_cache
+**/__pycache__
+*.vsix
+.env
